@@ -1,397 +1,644 @@
 ---@meta
+--- async.lua — cooperative async scheduler for Lua/LÖVE (fixed version)
 
---- async.lua - A lightweight cooperative multitasking library for Lua and LÖVE.
----
---- Features:
---- * pure Lua with LÖVE optimizations (non-blocking sleep).
---- * Promise-like chaining (:next, :catch).
---- * Async/Await syntax simulation.
---- * robust error handling and coroutine management.
----
---- Usage Example:
---- ```lua
---- local async = require("async")
----
---- -- Start a task
---- async(function()
----     print("Start")
----     async.sleep(1.0) -- Non-blocking wait
----     print("End")
---- end)
----
---- -- Update loop
---- function love.update(dt)
----     async.update()
---- end
---- ```
----
 ---@class Async
 local async = {}
 async.__index = async
 
--- Detect LÖVE environment
-local IS_LOVE = love and love.timer and true or false
+-- Detect LÖVE
+local IS_LOVE = type(love) == "table"
+    and type(love.timer) == "table"
+    and type(love.timer.getTime) == "function"
 
---- Gets the current time in seconds.
---- Uses `love.timer.getTime` if available, otherwise `os.clock`.
-async.gettime = IS_LOVE and love.timer.getTime or os.clock
+local has_socket, socket_mod = pcall(require, "socket")
+async.gettime = IS_LOVE and love.timer.getTime
+             or (has_socket and socket_mod.gettime)
+             or os.clock
 
--- Internal tables (arrays for FIFO order)
-local queue = {} -- Tasks waiting to start
-local stack = {} -- Active tasks
+local CURRENT_TASK = nil
 
--- Compatibility
+local LOG_LEVELS = { off = 0, error = 1, warn = 2, info = 3, debug = 4, trace = 5 }
+local LOG_LEVEL_NAMES = { [0] = "off", [1] = "error", [2] = "warn", [3] = "info", [4] = "debug", [5] = "trace" }
+
+local function normalizeLogLevel(level)
+    if type(level) == "number" then
+        if level < 0 then return 0 end
+        if level > 5 then return 5 end
+        return level
+    end
+    if type(level) == "string" then
+        local k = string.lower(level)
+        local v = LOG_LEVELS[k]
+        if v ~= nil then return v end
+        local n = tonumber(level)
+        if n ~= nil then return normalizeLogLevel(n) end
+    end
+    return LOG_LEVELS.info
+end
+
+local function defaultLogSink(entry)
+    local parts = {
+        "[async]",
+        "[", entry.levelName or tostring(entry.level), "]",
+        "[", tostring(entry.time), "]",
+        " ",
+        tostring(entry.event)
+    }
+
+    local task = entry.task
+    if task and (task.id or task.src) then
+        parts[#parts + 1] = " task="
+        if task.id ~= nil then
+            parts[#parts + 1] = tostring(task.id)
+        end
+        if task.src ~= nil then
+            parts[#parts + 1] = " "
+            parts[#parts + 1] = tostring(task.src)
+            parts[#parts + 1] = ":"
+            parts[#parts + 1] = tostring(task.line or 0)
+        end
+    end
+
+    local fields = entry.fields
+    if type(fields) == "table" then
+        for k, v in pairs(fields) do
+            parts[#parts + 1] = " "
+            parts[#parts + 1] = tostring(k)
+            parts[#parts + 1] = "="
+            parts[#parts + 1] = tostring(v)
+        end
+    end
+
+    local line = table.concat(parts)
+    if IS_LOVE then
+        print(line)
+    else
+        io.stderr:write(line .. "\n")
+    end
+end
+
+local LOGGER = { enabled = false, level = LOG_LEVELS.off, sink = nil, _inSink = false }
+
+local function taskRef(task)
+    if not task then return nil end
+    local info = rawget(task, "info") or {}
+    return {
+        id = rawget(task, "id"),
+        src = info.short_src,
+        line = info.linedefined,
+        name = info.name,
+        state = rawget(task, "state")
+    }
+end
+
+local function emitLog(level, event, fields, task)
+    if not LOGGER.enabled then return end
+
+    local nlevel = normalizeLogLevel(level)
+    if nlevel == 0 or nlevel > LOGGER.level then return end
+
+    local sink = LOGGER.sink or defaultLogSink
+    if LOGGER._inSink then return end
+
+    LOGGER._inSink = true
+    local ok, err = pcall(sink, {
+        time = async.gettime(),
+        level = nlevel,
+        levelName = LOG_LEVEL_NAMES[nlevel] or tostring(nlevel),
+        event = event,
+        fields = fields,
+        task = taskRef(task)
+    })
+    LOGGER._inSink = false
+
+    if not ok then
+        LOGGER.enabled = false
+        local msg = "[async][error][" .. tostring(async.gettime()) .. "] log sink error: " .. tostring(err) .. "\n"
+        if IS_LOVE then
+            print(msg)
+        else
+            io.stderr:write(msg)
+        end
+    end
+end
+
+function async.setLogEnabled(enabled)
+    LOGGER.enabled = not not enabled
+end
+
+function async.setLogLevel(level)
+    LOGGER.level = normalizeLogLevel(level)
+end
+
+function async.setLogSink(sink)
+    if sink ~= nil and type(sink) ~= "function" then
+        error("log sink must be a function or nil", 2)
+    end
+    LOGGER.sink = sink
+end
+
+function async.log(level, event, fields)
+    emitLog(level, event, fields, CURRENT_TASK)
+end
+
+-- scheduler state
+local queue = {}
+local stack = {}
+local sleepers = {}
+
+-- FIX: track currently running task
+local TASK_ID = 0
+local MAX_TASK_ID = 2^31
+
 local unpack = unpack or table.unpack
-local pack = table.pack or function(...) return {n = select("#", ...), ...} end
+local pack = table.pack or function(...) return { n = select("#", ...), ... } end
 
 local crunning, ccreate = coroutine.running, coroutine.create
 local cresume, cyield = coroutine.resume, coroutine.yield
 local cstatus = coroutine.status
 
 ---@class Async.Task
----@field routine thread The underlying coroutine.
----@field args table|nil Packed arguments to pass on resume.
----@field info debuginfo|nil Debug info about the source function.
----@field result table|nil Packed results (including n) upon completion.
----@field error string|nil Error message if the task crashed or timed out.
----@field timeout number|nil Timestamp when the task should timeout.
----@field stopped boolean Flag indicating if the task was manually stopped.
----@field onNext Async.Task|nil The next task to run after success.
----@field onError Async.Task|nil The task to run on error.
----@field handleError fun(self: Async.Task) Internal error routing.
+---@field routine thread
+---@field args table|nil
+---@field info table|nil
+---@field result table|nil
+---@field error string|nil
+---@field timeout number|nil
+---@field stopped boolean
+---@field onNext Async.Task[]|nil
+---@field onError Async.Task[]|nil
+---@field state string
+---@field wakeTime number|nil
 
---- Default error handler. Prints to console/stderr.
---- Can be overwritten: `async.errorhandler = function(task, err) ... end`
----@param task Async.Task The task that failed.
----@param err string The error message.
 function async.errorhandler(task, err)
+    if LOGGER.enabled and LOGGER.level >= LOG_LEVELS.error then
+        emitLog(LOG_LEVELS.error, "unhandled_error", { error = err }, task)
+        return
+    end
     local msg = string.format("[Async Error] %s\n%s\n", tostring(task), tostring(err))
     if IS_LOVE then print(msg) else io.stderr:write(msg) end
 end
 
 -- ==========================================
--- INTERNAL: Create task WITHOUT scheduling
+-- task creation
 -- ==========================================
 
---- Internal factory to create a task object safely.
----@param func function The function to run.
----@param ... any Arguments to pass to the function.
----@return Async.Task|nil task The created task object.
----@return string|nil error Error message if creation failed.
 local function createTask(func, ...)
     if type(func) ~= "function" then
-        return nil, "bad argument #1 (function expected, got " .. type(func) .. ")"
+        return nil, "function expected"
     end
 
     local task = setmetatable({}, async)
-    ---@cast task Async.Task
 
-    local ok, routineOrErr = pcall(ccreate, func)
-    if not ok then return nil, tostring(routineOrErr) end
-    local routine = routineOrErr
-    
-    task.routine = routine
+    local ok, co = pcall(ccreate, func)
+    if not ok then return nil, tostring(co) end
+
+    TASK_ID = (TASK_ID + 1) % MAX_TASK_ID
+    task.id = TASK_ID
+    task.routine = co
     task.args = pack(...)
-    if debug and debug.getinfo then
-        local infoOk, infoOrErr = pcall(debug.getinfo, func, "nS")
-        task.info = infoOk and infoOrErr or nil
-    else
-        task.info = nil
-    end
     task.result = nil
     task.error = nil
     task.timeout = nil
     task.stopped = false
     task.onNext = nil
     task.onError = nil
-    
+    task.state = "pending"
+    task.wakeTime = nil
+
+    if debug and debug.getinfo then
+        local ok2, info = pcall(debug.getinfo, func, "nS")
+        task.info = ok2 and info or nil
+    end
+
+    emitLog(LOG_LEVELS.debug, "task_create", nil, task)
     return task
 end
 
--- ==========================================
--- PUBLIC API: Create and schedule task
--- ==========================================
-
---- Creates a new async task and schedules it for execution.
---- Can also be called as `async(func, ...)`.
----@param func function The function to execute asynchronously.
----@param ... any Arguments passed to the function.
----@return Async.Task|nil task The created task, or nil on error.
----@return string|nil err Error message if creation failed.
 function async.new(func, ...)
     local task, err = createTask(func, ...)
     if not task then return nil, err end
-    
-    table.insert(queue, task) -- Schedule immediately
+    queue[#queue+1] = task
+    emitLog(LOG_LEVELS.debug, "task_enqueue", nil, task)
     return task
 end
 
-setmetatable(async, {__call = function(_, ...) return async.new(...) end})
+setmetatable(async, { __call = function(_, ...) return async.new(...) end })
 
 -- ==========================================
--- Task methods
+-- task execution
 -- ==========================================
 
---- Execute one step of the task.
---- Internal method called by async.update().
----@param self Async.Task
-function async:perform()
+function async:_perform(...)
     if self.stopped then return end
-    
-    -- Check timeout
+
     if self.timeout and async.gettime() >= self.timeout then
         self.error = "timeout"
-        self:handleError()
+        self.state = "errored"
+        emitLog(LOG_LEVELS.warn, "task_timeout", nil, self)
+        self:_handleError()
         return
     end
-    
-    -- Resume coroutine (capture ALL return values)
+
     local args = self.args
     self.args = nil
-    
+    self.state = "running"
+
+    CURRENT_TASK = self
+    emitLog(LOG_LEVELS.trace, "task_resume", nil, self)
+
     local results
     if args and args.n > 0 then
-        results = pack(cresume(self.routine, unpack(args, 1, args.n)))
+        results = pack(cresume(self.routine, unpack(args,1,args.n)))
     else
-        results = pack(cresume(self.routine))
+        results = pack(cresume(self.routine, ...))
     end
-    
-    local ok = results[1]
-    
-    -- Handle error
-    if not ok then
-        local errMsg = tostring(results[2])
+
+    CURRENT_TASK = nil
+
+    if not results[1] then
+        local err = tostring(results[2])
         if debug and debug.traceback then
-            errMsg = errMsg .. "\n" .. debug.traceback(self.routine)
+            err = err .. "\n" .. debug.traceback(self.routine)
         end
-        self.error = errMsg
-        self:handleError()
+        self.error = err
+        self.state = "errored"
+        emitLog(LOG_LEVELS.error, "task_error", { error = err }, self)
+        self:_handleError()
         return
     end
-    
-    -- Check if finished (dead) vs yielded
+
     if cstatus(self.routine) == "dead" then
-        -- Task completed - store all return values
-        -- We shift values left to remove the boolean 'true' from pcall/resume
-        local returnValues = { n = results.n - 1 }
-        for i = 2, results.n do
-            returnValues[i - 1] = results[i]
-        end
-        self.result = returnValues
-        
-        -- Schedule chained task (only NOW, not before)
+        local r = { n = results.n-1 }
+        for i=2,results.n do r[i-1]=results[i] end
+        self.result = r
+        self.state = "completed"
+        emitLog(LOG_LEVELS.debug, "task_complete", { results = r.n }, self)
+
         if self.onNext then
-            self.onNext.args = self.result
-            table.insert(queue, self.onNext)
+            for _,t in ipairs(self.onNext) do
+                t.args = self.result
+                queue[#queue+1] = t
+            end
         end
+    else
+        emitLog(LOG_LEVELS.trace, "task_yield", nil, self)
     end
 end
 
---- internal error routing
----@param self Async.Task
-function async:handleError()
-    if self.onError then
-        self.onError.args = pack(self.error)
-        table.insert(queue, self.onError)
+function async:_handleError()
+    if self.onError and #self.onError>0 then
+        for _,t in ipairs(self.onError) do
+            t.args = pack(self.error)
+            queue[#queue+1] = t
+        end
     else
         async.errorhandler(self, self.error)
     end
 end
 
---- Chains a function to be executed when this task completes successfully.
---- The callback receives the return values of the previous task.
----@param callback function
----@return Async.Task onNext The chained task (not scheduled until parent finishes).
----@param self Async.Task
-function async:next(callback)
-    local task, err = createTask(callback)
-    if not task then error(err, 2) end
+-- ==========================================
+-- chaining
+-- ==========================================
 
-    self.onNext = task -- Just create, don't queue yet!
-    return task
+function async:next(fn)
+    local t,err = createTask(fn)
+    if not t then error(err,2) end
+    self.onNext = self.onNext or {}
+    self.onNext[#self.onNext+1] = t
+    return t
 end
 
---- Chains a function to be executed if this task fails (error or timeout).
---- The callback receives the error string.
----@param errfunc function
----@return Async.Task self Returns the original task for chaining.
----@param self Async.Task
-function async:catch(errfunc)
-    local task, err = createTask(errfunc)
-    if not task then error(err, 2) end
-
-    self.onError = task -- Just create, don't queue yet!
+function async:catch(fn)
+    local t,err = createTask(fn)
+    if not t then error(err,2) end
+    self.onError = self.onError or {}
+    self.onError[#self.onError+1] = t
     return self
 end
 
---- Stops the task. It will be removed from execution on the next update.
----@return Async.Task self
----@param self Async.Task
 function async:stop()
     self.stopped = true
+    self.state = "stopped"
+    emitLog(LOG_LEVELS.info, "task_stop", nil, self)
+    local awaiting = rawget(self, "_awaiting")
+    if awaiting and getmetatable(awaiting) == async then
+        awaiting:stop()
+    end
+    self._awaiting = nil
     return self
 end
 
---- Sets a timeout for this task.
---- If the task doesn't finish before the delay, it errors with "timeout".
----@param delay number Seconds to wait before timing out.
----@return Async.Task self
----@param self Async.Task
 function async:setTimeout(delay)
-    if type(delay) ~= "number" then
-        error("bad argument #1 to 'setTimeout' (number expected, got " .. type(delay) .. ")", 2)
-    end
     self.timeout = async.gettime() + delay
+    emitLog(LOG_LEVELS.debug, "task_set_timeout", { timeout = self.timeout }, self)
     return self
 end
 
+function async:getState() return self.state end
+function async:isCompleted() return self.state=="completed" end
+function async:isErrored() return self.state=="errored" end
+function async:isRunning() return self.state=="running" or self.state=="pending" end
+
 -- ==========================================
--- Main update loop
+-- scheduler update (FIXED fairness + timeout)
 -- ==========================================
 
---- Main update loop. Must be called every frame (e.g., in love.update).
---- Handles processing the stack, queue, and transitioning tasks.
-function async.update()
-    -- 1. Swap stack (double buffering) to allow safe modification during iteration
+function async.update(...)
+    local now = async.gettime()
+    emitLog(LOG_LEVELS.trace, "tick_begin", { queued = #queue, ready = #stack, sleeping = #sleepers }, CURRENT_TASK)
+
+    local awake = {}
+    local still = {}
+
+    for _,task in ipairs(sleepers) do
+        if task.stopped or cstatus(task.routine) == "dead" then
+            task.wakeTime = nil
+            task._inSleepers = nil
+        elseif task.timeout and now >= task.timeout then
+            task.error="timeout"
+            task.state="errored"
+            task.wakeTime = nil
+            task._inSleepers = nil
+            emitLog(LOG_LEVELS.warn, "task_timeout", { timeout = task.timeout }, task)
+            task:_handleError()
+        elseif now >= task.wakeTime then
+            task.wakeTime=nil
+            task._inSleepers=nil
+            awake[#awake+1]=task
+            emitLog(LOG_LEVELS.trace, "task_wake", nil, task)
+        else
+            still[#still+1]=task
+        end
+    end
+
+    sleepers = still
+
     local currentStack = stack
-    stack = {}
-    
-    -- 2. Process active tasks
-    for _, task in ipairs(currentStack) do
-        task:perform()
-        -- Re-queue if alive, no error, and not stopped
-        if cstatus(task.routine) ~= "dead" and not task.error and not task.stopped then
-            table.insert(stack, task)
-        end
-    end
-    
-    -- 3. Process new queue (snapshot to prevent infinite recursion of new tasks)
     local currentQueue = queue
+    stack = {}
     queue = {}
-    
-    for _, task in ipairs(currentQueue) do
-        table.insert(stack, task)
-        task:perform()
-        -- Optimization: Remove if finished immediately
-        if cstatus(task.routine) == "dead" or task.error or task.stopped then
-            table.remove(stack)
+
+    local runList = {}
+    for _,t in ipairs(awake) do runList[#runList+1]=t end
+    for _,t in ipairs(currentQueue) do runList[#runList+1]=t end
+    for _,t in ipairs(currentStack) do runList[#runList+1]=t end
+
+    for _,task in ipairs(runList) do
+        task:_perform(...)
+        if cstatus(task.routine)~="dead" and not task.error and not task.stopped and not task.wakeTime and not task._inSleepers then
+            stack[#stack+1]=task
         end
     end
+
+    emitLog(LOG_LEVELS.trace, "tick_end", { queued = #queue, ready = #stack, sleeping = #sleepers }, CURRENT_TASK)
 end
 
 -- ==========================================
--- Utility functions (For use inside async functions)
+-- utilities
 -- ==========================================
 
---- Checks if the current code is running inside an async task (coroutine).
----@return boolean
 function async.running()
-    local co, isMain = crunning()
-    return (co ~= nil) and (not isMain)
+    local co,isMain = crunning()
+    return co~=nil and not isMain
 end
 
---- Yields execution back to the main loop for one frame.
---- Must be called inside an async function.
----@param ... any Arguments returned to the update loop (usually ignored).
----@return any ... Arguments passed back when resumed (usually nil).
 function async.yield(...)
     return cyield(...)
 end
 
---- Pauses the current task for `delay` seconds.
---- Non-blocking (cooperative). Other tasks and the game loop continue running.
----@param delay number Seconds to sleep.
+-- FIXED sleep
 function async.sleep(delay)
-    if type(delay) ~= "number" then
-        error("bad argument #1 to 'sleep' (number expected, got " .. type(delay) .. ")", 2)
+    if not async.running() then error("sleep inside async only",2) end
+    local task = CURRENT_TASK
+    if not task then error("internal async error",2) end
+    task.wakeTime = async.gettime()+delay
+    emitLog(LOG_LEVELS.debug, "task_sleep", { delay = delay, wakeTime = task.wakeTime }, task)
+    if not task._inSleepers then
+        task._inSleepers = true
+        sleepers[#sleepers+1]=task
     end
-    if not async.running() then
-        error("sleep must be called inside async function", 2)
-    end
-    
-    local target = async.gettime() + delay
-    while async.gettime() < target do
-        cyield()
-    end
+    cyield()
 end
 
---- Pauses the current task and waits for another async function to complete.
----@param func function The function to await.
----@param ... any Arguments for the function.
----@return ... any The return values of the awaited function.
-function async.await(func, ...)
-    if not async.running() then
-        error("await must be called inside async function", 2)
+-- FIXED await cancellation
+function async.await(fn,...)
+    if not async.running() then error("await inside async only",2) end
+    local parent = CURRENT_TASK
+    local t, err
+    if getmetatable(fn) == async and type(fn.routine) == "thread" then
+        t = fn
+    else
+        t, err = async.new(fn,...)
+        if not t then return nil, err, "errored" end
     end
-    if type(func) ~= "function" then
-        error("bad argument #1 to 'await' (function expected, got " .. type(func) .. ")", 2)
-    end
-    
-    local task = async.new(func, ...)
-    ---@cast task Async.Task
-    
-    -- Busy wait (yielding) until task is done
-    while not task.result and not task.error and not task.stopped do
-        cyield()
-    end
-    
-    if task.stopped then return nil, "stopped" end
-    if task.error then return nil, task.error end
-    local result = task.result
-    ---@cast result table
-    return unpack(result, 1, result.n)
-end
 
---- Pauses the current task until `func` returns a truthy value or timeout occurs.
---- Useful for polling conditions (e.g., waiting for a file to load).
----@param func function A function that returns true/value when done.
----@param timeout number|nil Max seconds to wait (default: infinite).
----@param ... any Arguments passed to func every tick.
----@return ... any The results from func, or (nil, 'timeout').
-function async.waitfor(func, timeout, ...)
-    if not async.running() then
-        error("waitfor must be called inside async function", 2)
+    if parent and getmetatable(parent) == async then
+        parent._awaiting = t
     end
-    if type(func) ~= "function" then
-        error("bad argument #1 to 'waitfor' (function expected, got " .. type(func) .. ")", 2)
-    end
-    if timeout ~= nil and type(timeout) ~= "number" then
-        error("bad argument #2 to 'waitfor' (number expected, got " .. type(timeout) .. ")", 2)
-    end
-    
-    local deadline = async.gettime() + (timeout or math.huge)
-    
-    while true do
-        local res = pack(func(...))
-        if res[1] then
-            return unpack(res, 1, res.n)
+    emitLog(LOG_LEVELS.debug, "await_begin", { awaited = t.id }, parent)
+
+    local function clearAwaiting()
+        if parent and getmetatable(parent) == async then
+            parent._awaiting = nil
         end
-        
-        if async.gettime() > deadline then
+    end
+
+    while true do
+        if parent and parent.stopped then
+            t:stop()
+            clearAwaiting()
+            emitLog(LOG_LEVELS.info, "await_cancelled", { awaited = t.id }, parent)
+            return nil, "await cancelled", "stopped"
+        end
+
+        if t.stopped then
+            clearAwaiting()
+            emitLog(LOG_LEVELS.info, "await_stopped", { awaited = t.id }, parent)
+            return nil, "stopped", "stopped"
+        end
+
+        if t.error then
+            clearAwaiting()
+            emitLog(LOG_LEVELS.error, "await_errored", { awaited = t.id, error = t.error }, parent)
+            return nil, t.error, "errored"
+        end
+
+        if t.result then
+            local first = t.result[1]
+            if getmetatable(first) == async and type(first.routine) == "thread" then
+                if first == t then
+                    clearAwaiting()
+                    emitLog(LOG_LEVELS.error, "await_cycle", { awaited = t.id }, parent)
+                    return nil, "await cycle", "errored"
+                end
+                t = first
+                if parent and getmetatable(parent) == async then
+                    parent._awaiting = t
+                end
+            else
+                clearAwaiting()
+                emitLog(LOG_LEVELS.debug, "await_done", { awaited = t.id }, parent)
+                return unpack(t.result, 1, t.result.n)
+            end
+        else
+            cyield()
+        end
+    end
+end
+
+function async.waitfor(fn,timeout,...)
+    local deadline = timeout and (async.gettime()+timeout)
+    while true do
+        local r = pack(fn(...))
+        if r[1] then return unpack(r,1,r.n) end
+        if deadline and async.gettime()>=deadline then
+            return nil,"timeout"
+        end
+        cyield()
+    end
+end
+
+function async.getTaskCount()
+    return #stack + #queue + #sleepers
+end
+
+function async.clear()
+    stack,queue,sleepers = {},{},{}
+end
+
+function async:__tostring()
+    local i=self.info or {}
+    return string.format("Async<%d %s:%d>", self.id or 0, i.short_src or "?", i.linedefined or 0)
+end
+
+-- ==========================================
+-- promise helpers
+-- ==========================================
+
+function async.all(tasks)
+    if not async.running() then error("all inside async only",2) end
+    local results={}
+
+    while true do
+        local allDone=true
+        for i,t in ipairs(tasks) do
+            if t:isRunning() then
+                allDone=false
+            elseif t:isErrored() then
+                return nil,t.error
+            elseif t:isCompleted() and not results[i] then
+                -- FIX: normalized result
+                results[i] = { unpack(t.result,1,t.result.n) }
+            end
+        end
+        if allDone then return results end
+        cyield()
+    end
+end
+
+function async.race(tasks)
+    while true do
+        for i,t in ipairs(tasks) do
+            if t:isCompleted() then
+                return t.result,i,nil
+            elseif t:isErrored() then
+                return nil,i,t.error
+            end
+        end
+        cyield()
+    end
+end
+
+function async.delay(fn,delay,...)
+    local a=pack(...)
+    return async.new(function()
+        async.sleep(delay)
+        return fn(unpack(a,1,a.n))
+    end)
+end
+
+-- ==========================================
+-- LÖVE Thread integration
+-- ==========================================
+
+local HAS_LOVE_THREAD = IS_LOVE
+    and type(love.thread) == "table"
+    and type(love.thread.newThread) == "function"
+
+local _threadId = 0
+local MAX_THREAD_ID = 2^32
+
+--- Runs a function in a LÖVE thread and awaits the result.
+--- Must be called inside an async task.
+---@param threadFile string
+---@param input any
+---@param timeout number|nil
+---@return any result
+---@return string|nil err
+function async.thread(threadFile, input, timeout)
+    if not HAS_LOVE_THREAD then
+        error("async.thread requires LÖVE thread support", 2)
+    end
+    if not async.running() then
+        error("async.thread must be called inside async function", 2)
+    end
+    if type(threadFile) ~= "string" then
+        error("threadFile must be a string", 2)
+    end
+
+    timeout = timeout or 30
+    emitLog(LOG_LEVELS.debug, "thread_begin", { file = threadFile, timeout = timeout }, CURRENT_TASK)
+
+    _threadId = (_threadId + 1) % MAX_THREAD_ID
+    local inName = "async_in_" .. _threadId
+    local outName = "async_out_" .. _threadId
+
+    local thread = love.thread.newThread(threadFile)
+    local inCh = love.thread.getChannel(inName)
+    local outCh = love.thread.getChannel(outName)
+
+    -- send input before start
+    inCh:push(input)
+    thread:start(inName, outName)
+
+    local deadline = async.gettime() + timeout
+
+    while true do
+        -- parent task cancelled → stop waiting
+        if CURRENT_TASK and CURRENT_TASK.stopped then
+            inCh:clear()
+            outCh:clear()
+            emitLog(LOG_LEVELS.info, "thread_cancelled", { file = threadFile }, CURRENT_TASK)
+            return nil, "cancelled"
+        end
+
+        local terr = thread:getError()
+        if terr then
+            inCh:clear()
+            outCh:clear()
+            emitLog(LOG_LEVELS.error, "thread_error", { file = threadFile, error = terr }, CURRENT_TASK)
+            return nil, "thread error: " .. tostring(terr)
+        end
+
+        local value = outCh:pop()
+        if value ~= nil then
+            inCh:clear()
+            outCh:clear()
+            emitLog(LOG_LEVELS.debug, "thread_done", { file = threadFile }, CURRENT_TASK)
+            return value, nil
+        end
+
+        if async.gettime() >= deadline then
+            inCh:clear()
+            outCh:clear()
+            emitLog(LOG_LEVELS.warn, "thread_timeout", { file = threadFile, timeout = timeout }, CURRENT_TASK)
             return nil, "timeout"
         end
-        
+
         cyield()
     end
 end
 
---- Returns the total number of active and queued tasks.
----@return number count
-function async.getTaskCount()
-    return #stack + #queue
-end
-
---- Clears all active and queued tasks immediately.
-function async.clear()
-    stack = {}
-    queue = {}
-end
-
----@return string
----@param self Async.Task
-function async:__tostring()
-    local info = self.info or {}
-    return string.format("Async<%s:%d>", info.short_src or "?", info.linedefined or 0)
-end
 
 return async
