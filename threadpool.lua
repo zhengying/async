@@ -76,6 +76,36 @@ local loader = loadstring or load
 local unpack = unpack or table.unpack
 local pack = table.pack or function(...) return { n = select("#", ...), ... } end
 
+local sourceBase = love.filesystem and love.filesystem.getSourceBaseDirectory and love.filesystem.getSourceBaseDirectory()
+if type(sourceBase) ~= "string" then
+    sourceBase = "."
+end
+
+local source = love.filesystem and love.filesystem.getSource and love.filesystem.getSource()
+local root = sourceBase
+if type(source) == "string" and source ~= "" then
+    if source:match("%.love$") then
+        root = source:match("^(.*)[/\\]") or sourceBase
+    else
+        root = source
+    end
+    if not (root:sub(1, 1) == "/" or root:match("^%a:[/\\]")) then
+        root = sourceBase .. "/" .. root
+    end
+end
+
+package.path = root .. "/?.lua;" .. root .. "/?/init.lua;" .. package.path
+local cpaths = {
+    root .. "/https_libs/?.so", root .. "/https_libs/?.dylib", root .. "/https_libs/?.dll",
+    root .. "/../https_libs/?.so", root .. "/../https_libs/?.dylib", root .. "/../https_libs/?.dll",
+    root .. "/../../https_libs/?.so", root .. "/../../https_libs/?.dylib", root .. "/../../https_libs/?.dll",
+    root .. "/../../../https_libs/?.so", root .. "/../../../https_libs/?.dylib", root .. "/../../../https_libs/?.dll",
+    root .. "/../../../../https_libs/?.so", root .. "/../../../../https_libs/?.dylib", root .. "/../../../../https_libs/?.dll",
+    root .. "/libs/?.so", root .. "/libs/?.dylib", root .. "/libs/?.dll",
+    root .. "/?.so", root .. "/?.dylib", root .. "/?.dll"
+}
+package.cpath = table.concat(cpaths, ";") .. ";" .. package.cpath
+
 local function makeCtx(id, cancelName)
     local cancelCh = love.thread.getChannel(cancelName)
     return {
@@ -124,6 +154,8 @@ while true do
                 resultCh:push({ id = id, error = r })
             end
         end
+    elseif job.type == "quit" then
+        return
     end
 end
 ]]
@@ -156,6 +188,7 @@ function ThreadPool.new(size)
     self.workerJobNames = {}
     self.workerJobCh = {}
     self._rr = 0
+    self.destroyed = false
 
     for i = 1, self.size do
         local jobName = self.prefix .. "_job_" .. i
@@ -169,7 +202,7 @@ function ThreadPool.new(size)
     end
 
     -- async pump
-    async(function()
+    self._pumpTask = async(function()
         while true do
             self:_pumpResults()
             self:_pumpProgress()
@@ -186,6 +219,7 @@ end
 -- =====================================================
 
 function ThreadPool:register(name, fn)
+    assert(not self.destroyed, "ThreadPool is destroyed")
     assert(type(name)=="string")
     assert(type(fn)=="function")
 
@@ -210,7 +244,9 @@ function ThreadPool:_nextId()
 end
 
 function ThreadPool:submit(name, payload, opts)
+    assert(not self.destroyed, "ThreadPool is destroyed")
     opts = opts or {}
+    local pool = self
     local id = self:_nextId()
     async.log("info", "threadpool_submit", { name = name, jobId = id, timeout = opts.timeout })
 
@@ -223,6 +259,13 @@ function ThreadPool:submit(name, payload, opts)
     self.pending[id] = slot
     slot.cancelCh = love.thread.getChannel(slot.cancelName)
     slot.cancelCh:clear()
+
+    local function cleanupPending()
+        pool.pending[id] = nil
+        if slot.cancelCh then
+            slot.cancelCh:clear()
+        end
+    end
 
     local task = async(function()
         self._rr = (self._rr % self.size) + 1
@@ -240,13 +283,14 @@ function ThreadPool:submit(name, payload, opts)
         end, opts.timeout)
 
         if not ok then
-            self:cancel(id)
+            pool:cancel(id)
             async.log("warn", "threadpool_wait_timeout", { name = name, jobId = id, timeout = opts.timeout })
+            cleanupPending()
             error(err or "timeout")
         end
 
         local packet = slot.packet
-        self.pending[id] = nil
+        pool.pending[id] = nil
         slot.cancelCh:clear()
 
         if packet.canceled then error("canceled") end
@@ -257,19 +301,51 @@ function ThreadPool:submit(name, payload, opts)
         end
     end)
 
-    if opts.timeout then task:setTimeout(opts.timeout) end
-
     function task:onProgress(fn)
         table.insert(slot.progressHandlers, fn)
         return task
     end
 
     function task:cancel()
-        task.stopped = true
-        self:cancel(id)
+        pool:cancel(id)
+        cleanupPending()
+        return async.stop(task)
+    end
+
+    function task:stop()
+        pool:cancel(id)
+        cleanupPending()
+        return async.stop(task)
     end
 
     return task
+end
+
+function ThreadPool:destroy()
+    if self.destroyed then
+        return
+    end
+    self.destroyed = true
+
+    if self._pumpTask and type(self._pumpTask.stop) == "function" then
+        self._pumpTask:stop()
+    end
+
+    for id, slot in pairs(self.pending) do
+        if slot and slot.cancelCh then
+            slot.cancelCh:push(true)
+        end
+        self.pending[id] = nil
+    end
+
+    for i = 1, self.size do
+        if self.workerJobCh[i] then
+            self.workerJobCh[i]:push({ type = "quit" })
+        end
+    end
+
+    if self.resultCh then self.resultCh:clear() end
+    if self.progressCh then self.progressCh:clear() end
 end
 
 -- =====================================================

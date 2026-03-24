@@ -125,6 +125,30 @@ do
   async.setLogSink(function(e)
     events[#events + 1] = e
   end)
+  async.setLogLevel("error")
+  async.setLogEnabled(true)
+
+  local state
+  async(function()
+    local _, _, s = async.await(function()
+      error("boom")
+    end)
+    state = s
+  end)
+
+  h.step(0, 5)
+
+  t.assertEq(state, "errored", "awaited error should return errored state")
+  t.assertTrue(anyEvent(events, "task_error"), "expected task_error event")
+  t.assertEq(anyEvent(events, "unhandled_error"), false, "awaited error should not be treated as unhandled")
+end
+
+resetAll()
+do
+  local events = {}
+  async.setLogSink(function(e)
+    events[#events + 1] = e
+  end)
   async.setLogLevel("info")
   async.setLogEnabled(true)
 

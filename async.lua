@@ -148,7 +148,7 @@ local sleepers = {}
 
 -- FIX: track currently running task
 local TASK_ID = 0
-local MAX_TASK_ID = 2^31
+local MAX_TASK_ID = 2^53 - 1
 
 local unpack = unpack or table.unpack
 local pack = table.pack or function(...) return { n = select("#", ...), ... } end
@@ -193,7 +193,10 @@ local function createTask(func, ...)
     local ok, co = pcall(ccreate, func)
     if not ok then return nil, tostring(co) end
 
-    TASK_ID = (TASK_ID + 1) % MAX_TASK_ID
+    if TASK_ID >= MAX_TASK_ID then
+        error("task id overflow", 2)
+    end
+    TASK_ID = TASK_ID + 1
     task.id = TASK_ID
     task.routine = co
     task.args = pack(...)
@@ -281,6 +284,8 @@ function async:_perform(...)
                 queue[#queue+1] = t
             end
         end
+        self.onNext = nil
+        self.onError = nil
     else
         emitLog(LOG_LEVELS.trace, "task_yield", nil, self)
     end
@@ -292,7 +297,13 @@ function async:_handleError()
             t.args = pack(self.error)
             queue[#queue+1] = t
         end
+        self.onNext = nil
+        self.onError = nil
     else
+        local awaiters = rawget(self, "_awaiters")
+        if type(awaiters) == "number" and awaiters > 0 then
+            return
+        end
         async.errorhandler(self, self.error)
     end
 end
@@ -438,28 +449,62 @@ function async.await(fn,...)
     end
     emitLog(LOG_LEVELS.debug, "await_begin", { awaited = t.id }, parent)
 
+    local function incAwaiter(task)
+        if getmetatable(task) ~= async then return end
+        task._awaiters = (rawget(task, "_awaiters") or 0) + 1
+    end
+
+    local function decAwaiter(task)
+        if getmetatable(task) ~= async then return end
+        local n = (rawget(task, "_awaiters") or 0) - 1
+        if n <= 0 then
+            task._awaiters = nil
+        else
+            task._awaiters = n
+        end
+    end
+
     local function clearAwaiting()
         if parent and getmetatable(parent) == async then
             parent._awaiting = nil
         end
     end
 
+    local awaited = nil
+    local function setAwaited(nextTask)
+        if awaited then
+            decAwaiter(awaited)
+            awaited = nil
+        end
+        awaited = nextTask
+        if awaited then
+            incAwaiter(awaited)
+        end
+    end
+
+    local function finish()
+        setAwaited(nil)
+        clearAwaiting()
+    end
+
+    setAwaited(t)
+
     while true do
         if parent and parent.stopped then
             t:stop()
-            clearAwaiting()
+            finish()
             emitLog(LOG_LEVELS.info, "await_cancelled", { awaited = t.id }, parent)
             return nil, "await cancelled", "stopped"
         end
 
         if t.stopped then
-            clearAwaiting()
+            finish()
             emitLog(LOG_LEVELS.info, "await_stopped", { awaited = t.id }, parent)
             return nil, "stopped", "stopped"
         end
 
         if t.error then
-            clearAwaiting()
+            finish()
             emitLog(LOG_LEVELS.error, "await_errored", { awaited = t.id, error = t.error }, parent)
             return nil, t.error, "errored"
         end
@@ -468,16 +513,17 @@ function async.await(fn,...)
             local first = t.result[1]
             if getmetatable(first) == async and type(first.routine) == "thread" then
                 if first == t then
-                    clearAwaiting()
+                    finish()
                     emitLog(LOG_LEVELS.error, "await_cycle", { awaited = t.id }, parent)
                     return nil, "await cycle", "errored"
                 end
                 t = first
+                setAwaited(t)
                 if parent and getmetatable(parent) == async then
                     parent._awaiting = t
                 end
             else
-                clearAwaiting()
+                finish()
                 emitLog(LOG_LEVELS.debug, "await_done", { awaited = t.id }, parent)
                 return unpack(t.result, 1, t.result.n)
             end

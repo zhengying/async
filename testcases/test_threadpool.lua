@@ -19,6 +19,7 @@ else
   t.assertTrue(type(pool.submit) == "function", "pool.submit should exist")
   t.assertTrue(type(pool.register) == "function", "pool.register should exist")
   t.assertTrue(type(pool.await) == "function", "pool.await should exist")
+  t.assertTrue(type(pool.destroy) == "function", "pool.destroy should exist")
 
   pool:register("echo", function(payload, ctx)
     ctx.progress(0.5, { msg = "half" })
@@ -47,4 +48,6 @@ else
   end, { dt = 0.01, maxSteps = 2000 })
   t.assertTrue(ok, err or "threadpool test did not complete")
   t.assertTrue(type(result) == "table" and result.a == 1, "threadpool echo should return payload")
+
+  pool:destroy()
 end

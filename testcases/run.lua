@@ -90,6 +90,16 @@ do
   if envLoveBin ~= nil or fileExists(loveBin) then
     local cmd = shellQuote(loveBin) .. " " .. shellQuote(loveProject)
     runCommand("love2d tests", cmd)
+
+    if tostring(os.getenv("ASYNC_HTTP_REAL") or "") == "1" then
+      local httpProject = rootDir .. "/examples/love/https"
+      local prefix = "ASYNC_HTTP_TEST=1"
+      if package.config:sub(1, 1) == "\\" then
+        prefix = "set ASYNC_HTTP_TEST=1 &&"
+      end
+      local httpCmd = prefix .. " " .. shellQuote(loveBin) .. " " .. shellQuote(httpProject)
+      runCommand("async_http real integration (network)", httpCmd)
+    end
   else
     io.stdout:write("[SKIP] love2d tests (LOVE_BIN not found)\n")
   end
