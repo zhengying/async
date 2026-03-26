@@ -20,7 +20,8 @@ local files = {
   rootDir .. "/testcases/test_async_sleep_timeout.lua",
   rootDir .. "/testcases/test_async_await_waitfor.lua",
   rootDir .. "/testcases/test_async_promises.lua",
-  rootDir .. "/testcases/test_threadpool.lua"
+  rootDir .. "/testcases/test_threadpool.lua",
+  rootDir .. "/testcases/test_agent.lua"
 }
 
 local total = 0
