@@ -567,6 +567,42 @@ end
 do
   harness.reset()
 
+  local captured = {}
+  local client = {
+    provider = "openai",
+    chat = function(_, params)
+      captured[#captured + 1] = params
+      return makeChatTask({
+        text = "done",
+        json = { choices = { { message = { role = "assistant", content = "done" } } } }
+      })
+    end
+  }
+
+  local a = agent.Agent.new({
+    client = client,
+    registry = agent.ToolRegistry.new(),
+    withPlan = false
+  })
+
+  local task = async(function()
+    local result = async.await(a:run("latest news", {
+      withPlan = false
+    }))
+    T.assertEq(result.text, "done")
+  end)
+  local ok, err = harness.runUntil(function()
+    return task.result ~= nil or task.error ~= nil
+  end, { maxSteps = 1000 })
+  T.assertTrue(ok, err)
+  T.assertTrue(task.error == nil, tostring(task.error))
+  T.assertTrue(captured[1].extra.tools == nil, "empty registry should omit tools field")
+  T.assertTrue(captured[1].extra.tool_choice == nil, "empty registry should omit tool_choice")
+end
+
+do
+  harness.reset()
+
   local extracted = {
     session = {
       facts = { "The user's name is Alice." },

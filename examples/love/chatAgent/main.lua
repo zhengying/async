@@ -67,28 +67,59 @@ package.cpath = repoRoot .. "/https_libs/?.so;" .. repoRoot .. "/https_libs/?.dy
 
 local async = require("async")
 local llm = require("llm")
+local agent = require("agent")
 local TextInput = require("love.ui_text_input")
 
 local clients = {}
 local currentProvider = "openai"
 local currentTask = nil
+local currentAgent = nil
+local chat = nil
 local inputBox = nil
 local history = {}
 local statusText = ""
 local errorText = ""
 local conversationScroll = 0
 local followLatest = true
+local pendingTurn = nil
 local defaultSystemPrompt = "You are a helpful assistant in a single persistent chat context. Treat every message in the current conversation as active context unless the user clears the session."
 local systemPrompt = os.getenv("CHAT_AGENT_SYSTEM_PROMPT") or defaultSystemPrompt
 local settings = nil
+local registry = agent.ToolRegistry.new()
+local sessionState = {
+  fileName = "chat_agent_session.json",
+  loadedSnapshot = nil,
+  loadedMessageStats = nil,
+  copiedMessageIndex = nil,
+  copiedAt = 0
+}
 local configState = {
   fileName = "chat_agent_config.json",
   isOpen = false,
   selectedProvider = "openai",
   editors = {},
-  fieldOrder = { "apiKey", "baseUrl", "model", "maxTokens", "systemPrompt" },
+  fieldOrder = { "apiKey", "baseUrl", "model", "maxTokens", "contextWindow", "systemPrompt" },
   layout = {}
 }
+local debugState = {
+  isOpen = false,
+  scroll = 0,
+  lastPlanText = "",
+  lastPlanError = "",
+  lastMemoryError = "",
+  lastGoal = "",
+  lastAnswer = "",
+  lastRoute = "none",
+  layout = {
+    x = 0,
+    y = 0,
+    w = 0,
+    h = 0,
+    bodyHeight = 0,
+    maxScroll = 0
+  }
+}
+local messageStats = {}
 
 local ui = {
   fonts = {},
@@ -142,20 +173,58 @@ local function trimText(value)
   return text
 end
 
+local function estimateTokenCount(text)
+  local value = tostring(text or "")
+  if value == "" then
+    return 0
+  end
+  local normalized = value:gsub("\r\n", "\n")
+  local chars = #normalized
+  local words = 0
+  for _ in normalized:gmatch("%S+") do
+    words = words + 1
+  end
+  local byChars = math.ceil(chars / 4)
+  local byWords = math.ceil(words * 1.35)
+  return math.max(1, math.max(byChars, byWords))
+end
+
+local function normalizeUsage(usage)
+  if type(usage) ~= "table" then
+    return nil
+  end
+  local promptTokens = tonumber(usage.prompt_tokens or usage.input_tokens or usage.promptTokens or usage.inputTokens)
+  local completionTokens = tonumber(usage.completion_tokens or usage.output_tokens or usage.completionTokens or usage.outputTokens)
+  local totalTokens = tonumber(usage.total_tokens or usage.totalTokens)
+  if not totalTokens then
+    totalTokens = (promptTokens or 0) + (completionTokens or 0)
+  end
+  if not promptTokens and not completionTokens and not totalTokens then
+    return nil
+  end
+  return {
+    prompt = promptTokens,
+    completion = completionTokens,
+    total = totalTokens
+  }
+end
+
 local function defaultProviderSettings(provider)
   if provider == "anthropic" then
     return {
       apiKey = os.getenv("ANTHROPIC_API_KEY") or "",
       baseUrl = os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com",
       model = os.getenv("ANTHROPIC_MODEL") or "claude-3-5-sonnet-20241022",
-      maxTokens = tostring(tonumber(os.getenv("ANTHROPIC_MAX_TOKENS") or "") or 1024)
+      maxTokens = tostring(tonumber(os.getenv("ANTHROPIC_MAX_TOKENS") or "") or 1024),
+      contextWindow = tostring(tonumber(os.getenv("ANTHROPIC_CONTEXT_WINDOW") or "") or 200000)
     }
   end
   return {
     apiKey = os.getenv("OPENAI_API_KEY") or "",
     baseUrl = os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1",
     model = os.getenv("OPENAI_MODEL") or "gpt-4o-mini",
-    maxTokens = tostring(tonumber(os.getenv("OPENAI_MAX_TOKENS") or "") or 1024)
+    maxTokens = tostring(tonumber(os.getenv("OPENAI_MAX_TOKENS") or "") or 1024),
+    contextWindow = tostring(tonumber(os.getenv("OPENAI_CONTEXT_WINDOW") or "") or 128000)
   }
 end
 
@@ -165,7 +234,8 @@ local function copyProviderSettings(value, fallback)
     apiKey = tostring((value and value.apiKey) or defaults.apiKey or ""),
     baseUrl = tostring((value and value.baseUrl) or defaults.baseUrl or ""),
     model = tostring((value and value.model) or defaults.model or ""),
-    maxTokens = tostring((value and value.maxTokens) or defaults.maxTokens or "")
+    maxTokens = tostring((value and value.maxTokens) or defaults.maxTokens or ""),
+    contextWindow = tostring((value and value.contextWindow) or defaults.contextWindow or "")
   }
 end
 
@@ -180,14 +250,14 @@ local function buildDefaultSettings()
   }
 end
 
-local function normalizeSettings(source)
+local function normalizeSettings(value)
   local defaults = buildDefaultSettings()
   local normalized = {
-    selectedProvider = tostring((source and source.selectedProvider) or defaults.selectedProvider),
-    systemPrompt = tostring((source and source.systemPrompt) or defaults.systemPrompt),
+    selectedProvider = tostring((value and value.selectedProvider) or defaults.selectedProvider),
+    systemPrompt = tostring((value and value.systemPrompt) or defaults.systemPrompt),
     providers = {
-      openai = copyProviderSettings(source and source.providers and source.providers.openai, defaults.providers.openai),
-      anthropic = copyProviderSettings(source and source.providers and source.providers.anthropic, defaults.providers.anthropic)
+      openai = copyProviderSettings(value and value.providers and value.providers.openai, defaults.providers.openai),
+      anthropic = copyProviderSettings(value and value.providers and value.providers.anthropic, defaults.providers.anthropic)
     }
   }
   if normalized.selectedProvider ~= "anthropic" then
@@ -209,6 +279,11 @@ end
 local function pointInRect(px, py, x, y, w, h)
   return px >= x and px <= x + w and py >= y and py <= y + h
 end
+
+local activeClient
+local activeModel
+local rebuildAgentSession
+local syncMessageStats
 
 local function resetHitboxes()
   ui.hitboxes = {}
@@ -248,6 +323,89 @@ local function saveSettings()
   return true
 end
 
+local function normalizeSavedSession(value)
+  if type(value) ~= "table" then
+    return nil
+  end
+  if type(value.snapshot) ~= "table" then
+    return nil
+  end
+  return {
+    snapshot = value.snapshot,
+    debug = type(value.debug) == "table" and value.debug or nil,
+    messageStats = type(value.messageStats) == "table" and value.messageStats or nil
+  }
+end
+
+local function loadSessionState()
+  if not love.filesystem or type(love.filesystem.getInfo) ~= "function" or not love.filesystem.getInfo(sessionState.fileName) then
+    sessionState.loadedSnapshot = nil
+    return
+  end
+  local data, err = love.filesystem.read(sessionState.fileName)
+  if type(data) ~= "string" or data == "" then
+    sessionState.loadedSnapshot = nil
+    if err then
+      errorText = "failed to read saved session: " .. tostring(err)
+    end
+    return
+  end
+  local ok, decoded = pcall(llm.jsonDecode, data)
+  if not ok then
+    sessionState.loadedSnapshot = nil
+    errorText = "failed to parse saved session: " .. tostring(decoded)
+    return
+  end
+  local normalized = normalizeSavedSession(decoded)
+  if not normalized then
+    sessionState.loadedSnapshot = nil
+    errorText = "saved session has invalid format"
+    return
+  end
+  sessionState.loadedSnapshot = normalized.snapshot
+  sessionState.loadedMessageStats = normalized.messageStats
+  if normalized.debug then
+    debugState.lastPlanText = tostring(normalized.debug.lastPlanText or "")
+    debugState.lastPlanError = tostring(normalized.debug.lastPlanError or "")
+    debugState.lastMemoryError = tostring(normalized.debug.lastMemoryError or "")
+    debugState.lastGoal = tostring(normalized.debug.lastGoal or "")
+    debugState.lastAnswer = tostring(normalized.debug.lastAnswer or "")
+    debugState.lastRoute = tostring(normalized.debug.lastRoute or "none")
+  end
+end
+
+local function saveSessionState()
+  if not love.filesystem or type(love.filesystem.write) ~= "function" then
+    return false, "filesystem write is unavailable"
+  end
+  local snapshot = chat and chat:exportState({ includeMetadata = true }) or {
+    history = {},
+    sessionMemory = "",
+    workspaceMemory = ""
+  }
+  local payload = {
+    snapshot = snapshot,
+    messageStats = messageStats,
+    debug = {
+      lastPlanText = debugState.lastPlanText,
+      lastPlanError = debugState.lastPlanError,
+      lastMemoryError = debugState.lastMemoryError,
+      lastGoal = debugState.lastGoal,
+      lastAnswer = debugState.lastAnswer,
+      lastRoute = debugState.lastRoute
+    }
+  }
+  local ok, encoded = pcall(llm.jsonEncode, payload)
+  if not ok then
+    return false, tostring(encoded)
+  end
+  local wrote, err = love.filesystem.write(sessionState.fileName, encoded)
+  if wrote == nil or wrote == false then
+    return false, tostring(err or "write failed")
+  end
+  return true
+end
+
 local function loadSettings()
   local loaded = nil
   if love.filesystem and type(love.filesystem.getInfo) == "function" and love.filesystem.getInfo(configState.fileName) then
@@ -268,6 +426,7 @@ local function loadSettings()
 end
 
 local function rebuildClients()
+  local snapshot = chat and chat:exportState({ includeMetadata = true }) or nil
   destroyClients()
 
   local openai = activeSettingsFor("openai")
@@ -304,6 +463,7 @@ local function rebuildClients()
       currentProvider = "anthropic"
     end
   end
+  rebuildAgentSession(snapshot)
 end
 
 local function focusEditor(name)
@@ -330,6 +490,7 @@ local function syncEditorsFromSettings()
   configState.editors.baseUrl:setText(providerSettings.baseUrl)
   configState.editors.model:setText(providerSettings.model)
   configState.editors.maxTokens:setText(providerSettings.maxTokens)
+  configState.editors.contextWindow:setText(providerSettings.contextWindow)
   configState.editors.systemPrompt:setText(settings.systemPrompt)
 end
 
@@ -343,6 +504,7 @@ local function syncSettingsFromEditors()
   providerSettings.baseUrl = trimText(configState.editors.baseUrl:getText())
   providerSettings.model = trimText(configState.editors.model:getText())
   providerSettings.maxTokens = trimText(configState.editors.maxTokens:getText())
+  providerSettings.contextWindow = trimText(configState.editors.contextWindow:getText())
   settings.systemPrompt = trimText(configState.editors.systemPrompt:getText())
   settings.selectedProvider = provider
   systemPrompt = settings.systemPrompt ~= "" and settings.systemPrompt or defaultSystemPrompt
@@ -357,6 +519,7 @@ local function openProviderConfig()
     errorText = ""
     return
   end
+  debugState.isOpen = false
   configState.isOpen = true
   configState.selectedProvider = settings and settings.selectedProvider or currentProvider
   syncEditorsFromSettings()
@@ -384,8 +547,335 @@ local function saveProviderConfig()
     return
   end
   rebuildClients()
+  saveSessionState()
   closeProviderConfig()
   statusText = "provider config saved"
+  errorText = ""
+end
+
+local function safeJson(value)
+  local ok, encoded = pcall(llm.jsonEncode, value)
+  if ok and type(encoded) == "string" then
+    return encoded
+  end
+  return tostring(encoded or value)
+end
+
+local function truncateText(value, maxChars)
+  local text = tostring(value or "")
+  local limit = tonumber(maxChars or 0) or 0
+  if limit > 0 and #text > limit then
+    return text:sub(1, limit) .. "..."
+  end
+  return text
+end
+
+local function syncHistoryFromSession()
+  history = chat and chat:getHistory() or {}
+end
+
+local function restoreLoadedSession()
+  if not chat or not sessionState.loadedSnapshot then
+    return
+  end
+  local ok = pcall(function()
+    chat:importState(sessionState.loadedSnapshot)
+  end)
+  if ok then
+    syncHistoryFromSession()
+  syncMessageStats()
+  end
+  if type(sessionState.loadedMessageStats) == "table" then
+    messageStats = sessionState.loadedMessageStats
+  end
+  syncMessageStats()
+  sessionState.loadedSnapshot = nil
+  sessionState.loadedMessageStats = nil
+end
+
+local function normalizeMessageStat(stat, historyItem)
+  local text = type(historyItem) == "table" and historyItem.content or ""
+  local usage = type(stat) == "table" and normalizeUsage(stat.usage or stat) or nil
+  return {
+    estimatedTokens = tonumber(type(stat) == "table" and stat.estimatedTokens) or estimateTokenCount(text),
+    usage = usage
+  }
+end
+
+syncMessageStats = function()
+  local normalized = {}
+  for index = 1, #history do
+    normalized[index] = normalizeMessageStat(messageStats[index], history[index])
+  end
+  messageStats = normalized
+end
+
+local function appendTurnStats(userText, answerText, usage)
+  messageStats[#messageStats + 1] = {
+    estimatedTokens = estimateTokenCount(userText),
+    usage = nil
+  }
+  messageStats[#messageStats + 1] = {
+    estimatedTokens = estimateTokenCount(answerText),
+    usage = normalizeUsage(usage)
+  }
+  syncMessageStats()
+end
+
+local function currentContextWindow()
+  local providerSettings = activeSettingsFor(currentProvider)
+  local configured = tonumber(trimText(providerSettings.contextWindow))
+  if configured and configured > 0 then
+    return configured
+  end
+  return 128000
+end
+
+local function estimatedContextTokens()
+  local total = estimateTokenCount(systemPrompt) + 12
+  for index = 1, #history do
+    local stat = messageStats[index]
+    local item = history[index]
+    total = total + (stat and stat.estimatedTokens or estimateTokenCount(item and item.content or "")) + 6
+  end
+  if pendingTurn and pendingTurn.goal then
+    total = total + estimateTokenCount(pendingTurn.goal) + 6
+  end
+  return total
+end
+
+local function contextUsageLabel()
+  local used = estimatedContextTokens()
+  local maxWindow = currentContextWindow()
+  return "ctx: " .. tostring(used) .. "/" .. tostring(maxWindow)
+end
+
+local function contextRemainLabel()
+  local remain = math.max(0, currentContextWindow() - estimatedContextTokens())
+  return "remain: " .. tostring(remain)
+end
+
+local function tokenLineForMessage(index, item)
+  local stat = messageStats[index]
+  local estimated = stat and stat.estimatedTokens or estimateTokenCount(item and item.content or "")
+  local parts = { "tokens est " .. tostring(estimated) }
+  local usage = stat and stat.usage or nil
+  if usage and usage.completion then
+    parts[#parts + 1] = "out " .. tostring(usage.completion)
+  end
+  if usage and usage.prompt then
+    parts[#parts + 1] = "in " .. tostring(usage.prompt)
+  end
+  if usage and usage.total then
+    parts[#parts + 1] = "total " .. tostring(usage.total)
+  end
+  return table.concat(parts, " • ")
+end
+
+local function currentRouteName(goal)
+  if not chat then
+    return "none"
+  end
+  local router = chat:getRouter()
+  if type(router) ~= "table" or type(router.select) ~= "function" then
+    return "none"
+  end
+  local _, routeName = router:select(goal or "", "run", {
+    session = chat,
+    history = chat:getHistory(),
+    memory = chat:getMemory(),
+    profile = chat:getProfile()
+  })
+  return tostring(routeName or "none")
+end
+
+rebuildAgentSession = function(snapshot)
+  local client = activeClient()
+  if not client then
+    currentAgent = nil
+    chat = nil
+    history = {}
+    return
+  end
+
+  currentAgent = agent.Agent.new({
+    client = client,
+    registry = registry,
+    system = systemPrompt,
+    withPlan = true,
+    maxSteps = 8,
+    temperature = 0.3,
+    maxHistoryMessages = 8,
+    maxHistorySummaryChars = 1200
+  })
+
+  chat = agent.Session.new({
+    agent = currentAgent,
+    profile = agent.SceneProfile.new({
+      name = "chat_agent_debug",
+      instructions = {
+        "Keep answers grounded in the ongoing session.",
+        "Prefer memory and prior turns before making new assumptions."
+      },
+      constraints = {
+        "Do not claim memory that is not present in the current session state.",
+        "If something is unknown, say so plainly."
+      },
+      planGuidelines = {
+        "Prefer short plans.",
+        "Use memory before global assumptions."
+      }
+    }),
+    memory = "Session strategy: keep multi-turn context and preserve durable user facts across this chat.",
+    memoryStore = agent.MemoryStore.new({
+      facts = {
+        "This chat demo is used to test the agent runtime."
+      },
+      goals = {
+        "Expose memory behavior and debug state clearly."
+      }
+    }),
+    workspaceMemory = "Workspace strategy: keep stable repository context that helps explain this async and agent demo.",
+    workspaceMemoryStore = agent.MemoryStore.new({
+      facts = {
+        "The repository demonstrates async Lua primitives, LLM clients, and agent patterns."
+      },
+      goals = {
+        "Support interactive debugging of planning and memory behavior."
+      }
+    }),
+    memoryExtractor = agent.MemoryExtractor.new({
+      client = client,
+      scopes = { "session", "workspace" },
+      maxHistoryMessages = 6,
+      maxHistoryChars = 220
+    }),
+    maxPlanningHistoryMessages = 8,
+    maxPlanningHistoryChars = 240
+  })
+
+  if snapshot then
+    pcall(function()
+      chat:importState(snapshot)
+    end)
+  end
+  syncHistoryFromSession()
+  restoreLoadedSession()
+end
+
+local function debugSections()
+  local sections = {}
+  local sessionState = chat and chat:exportState({ includeMetadata = true }) or nil
+  local sessionStore = chat and chat:getMemoryStore() or nil
+  local workspaceStore = chat and chat:getMemoryStore("workspace") or nil
+  local profile = chat and chat:getProfile() or nil
+  local extractor = chat and chat:getMemoryExtractor() or nil
+
+  sections[#sections + 1] = {
+    title = "Default Strategy",
+    text = table.concat({
+      "Current demo mode: agent.Session",
+      "History strategy: session history is appended turn by turn and passed through Session:ask.",
+      "Durable memory: session memory + session MemoryStore.",
+      "Workspace memory: workspace memory + workspace MemoryStore.",
+      "Extraction strategy: MemoryExtractor runs after each successful assistant answer.",
+      "Extractor scopes: session, workspace.",
+      "Planning: enabled before run with bounded recent history.",
+      "Router: " .. currentRouteName(debugState.lastGoal),
+      "Profile: " .. tostring(profile and profile.name or "none"),
+      "Memory extractor: " .. tostring(extractor ~= nil)
+    }, "\n")
+  }
+
+  sections[#sections + 1] = {
+    title = "Metrics",
+    text = table.concat({
+      "provider: " .. tostring(currentProvider),
+      "model: " .. tostring(activeModel()),
+      "history turns: " .. tostring(#history),
+      "pending turn: " .. tostring(pendingTurn ~= nil),
+      "last route: " .. tostring(debugState.lastRoute or "none"),
+      "plan status: " .. (debugState.lastPlanText ~= "" and "available" or (debugState.lastPlanError ~= "" and "error" or "empty")),
+      "memory error: " .. (debugState.lastMemoryError ~= "" and debugState.lastMemoryError or "<none>"),
+      "maxPlanningHistoryMessages: " .. tostring(sessionState and sessionState.metadata and sessionState.metadata.maxPlanningHistoryMessages or "n/a"),
+      "maxPlanningHistoryChars: " .. tostring(sessionState and sessionState.metadata and sessionState.metadata.maxPlanningHistoryChars or "n/a")
+    }, "\n")
+  }
+
+  sections[#sections + 1] = {
+    title = "Recent History",
+    text = #history > 0 and truncateText(safeJson(history), 6000) or "<empty>"
+  }
+
+  sections[#sections + 1] = {
+    title = "Session Memory",
+    text = chat and (chat:getMemory() or "<empty>") or "<no session>"
+  }
+
+  sections[#sections + 1] = {
+    title = "Session MemoryStore",
+    text = sessionStore and safeJson(sessionStore:exportState()) or "<empty>"
+  }
+
+  sections[#sections + 1] = {
+    title = "Workspace Memory",
+    text = chat and (chat:getMemory("workspace") or "<empty>") or "<no session>"
+  }
+
+  sections[#sections + 1] = {
+    title = "Workspace MemoryStore",
+    text = workspaceStore and safeJson(workspaceStore:exportState()) or "<empty>"
+  }
+
+  sections[#sections + 1] = {
+    title = "Last Plan",
+    text = debugState.lastPlanText ~= "" and debugState.lastPlanText or (debugState.lastPlanError ~= "" and ("plan error: " .. debugState.lastPlanError) or "<empty>")
+  }
+
+  sections[#sections + 1] = {
+    title = "Last Turn",
+    text = table.concat({
+      "goal:",
+      debugState.lastGoal ~= "" and debugState.lastGoal or "<empty>",
+      "",
+      "answer:",
+      debugState.lastAnswer ~= "" and debugState.lastAnswer or "<empty>"
+    }, "\n")
+  }
+
+  return sections
+end
+
+local function openDebugPanel()
+  debugState.isOpen = true
+  debugState.scroll = 0
+  configState.isOpen = false
+  statusText = "agent debug panel opened"
+  errorText = ""
+end
+
+local function closeDebugPanel()
+  debugState.isOpen = false
+  if inputBox then
+    inputBox:focus()
+  end
+end
+
+local function copyMessageText(item, index)
+  if not item or item.text == "" then
+    statusText = "nothing to copy"
+    errorText = ""
+    return
+  end
+  if not love.system or type(love.system.setClipboardText) ~= "function" then
+    statusText = "clipboard unavailable"
+    errorText = ""
+    return
+  end
+  love.system.setClipboardText(item.text)
+  sessionState.copiedMessageIndex = index
+  sessionState.copiedAt = love.timer and love.timer.getTime and love.timer.getTime() or 0
+  statusText = "message copied"
   errorText = ""
 end
 
@@ -411,6 +901,7 @@ local function ensureConfigEditors()
   configState.editors.baseUrl = createConfigEditor("Base URL", false)
   configState.editors.model = createConfigEditor("Model", false)
   configState.editors.maxTokens = createConfigEditor("Max tokens", false)
+  configState.editors.contextWindow = createConfigEditor("Context window", false)
   configState.editors.systemPrompt = createConfigEditor("System prompt", true)
 end
 
@@ -449,7 +940,7 @@ local function providerOrder()
   return { "openai", "anthropic" }
 end
 
-local function activeClient()
+activeClient = function()
   return clients[currentProvider]
 end
 
@@ -465,7 +956,7 @@ local function activeProviderLabel()
   return tostring(currentProvider)
 end
 
-local function activeModel()
+activeModel = function()
   local client = activeClient()
   if type(client) == "table" and type(client.model) == "string" and client.model ~= "" then
     return client.model
@@ -508,10 +999,22 @@ local function clearConversation()
     cancelCurrent()
     currentTask = nil
   end
+  if chat then
+    chat:clear()
+  end
   history = {}
+  messageStats = {}
+  pendingTurn = nil
+  debugState.lastPlanText = ""
+  debugState.lastPlanError = ""
+  debugState.lastMemoryError = ""
+  debugState.lastGoal = ""
+  debugState.lastAnswer = ""
+  debugState.lastRoute = "none"
   statusText = "conversation cleared"
   errorText = ""
   followLatest = true
+  saveSessionState()
 end
 
 cancelCurrent = function()
@@ -523,6 +1026,8 @@ cancelCurrent = function()
   else
     currentTask:stop()
   end
+  pendingTurn = nil
+  statusText = "stopped"
 end
 
 local function buildMessages(provider)
@@ -543,10 +1048,53 @@ local function buildMessages(provider)
   return messages
 end
 
-local function sendPrompt()
+local function formatRequestError(err, extra)
+  local message = tostring(err or "request failed")
+  if type(extra) == "table" and type(extra.body) == "string" then
+    local bodyLine = trimText(firstLine(extra.body))
+    if bodyLine ~= "" and not message:find(bodyLine, 1, true) then
+      message = message .. " | " .. truncateText(bodyLine, 180)
+    end
+  end
+  return message
+end
+
+local function shouldRetryWithRawChat(err, extra)
+  local statusCode = type(extra) == "table" and tonumber(extra.status) or 0
+  if statusCode == 400 then
+    return true
+  end
+  local text = tostring(err or "")
+  return text:find("json decode failed", 1, true) ~= nil
+end
+
+local function runRawChatFallback(prompt, provider, providerSettings)
   local client = activeClient()
   if not client then
-    statusText = "no client"
+    return nil, "no client", nil
+  end
+  local messages = buildMessages(provider)
+  messages[#messages + 1] = {
+    role = "user",
+    content = prompt
+  }
+  local request = {
+    model = activeModel(),
+    messages = messages,
+    temperature = 0.5,
+    timeout = 120,
+    max_tokens = tonumber(trimText(providerSettings.maxTokens))
+  }
+  if provider == "anthropic" then
+    request.system = systemPrompt
+    request.max_tokens = tonumber(trimText(providerSettings.maxTokens)) or 1024
+  end
+  return async.await(client:chat(request))
+end
+
+local function sendPrompt()
+  if not chat or not currentAgent then
+    statusText = "no agent session"
     errorText = "open provider settings and save a valid API key first"
     return
   end
@@ -562,65 +1110,89 @@ local function sendPrompt()
   end
 
   local provider = currentProvider
-  local model = client.model
-  local providerSettings = activeSettingsFor(provider)
-  appendMessage("user", prompt, {
+  local model = activeModel()
+  pendingTurn = {
+    goal = prompt,
     provider = provider,
     model = model
-  })
+  }
+  debugState.lastGoal = prompt
+  debugState.lastAnswer = ""
+  debugState.lastPlanText = ""
+  debugState.lastPlanError = ""
+  debugState.lastMemoryError = ""
+  debugState.lastRoute = currentRouteName(prompt)
   if inputBox and inputBox.setText then
     inputBox:setText("")
     inputBox:focus()
   end
-  statusText = "requesting..."
+  statusText = "planning + running..."
   errorText = ""
   followLatest = true
+  local providerSettings = activeSettingsFor(provider)
 
-  local request = {
-    model = model,
-    messages = buildMessages(provider),
-    temperature = 0.5,
-    timeout = 120,
-    max_tokens = tonumber(trimText(providerSettings.maxTokens))
-  }
-  if provider == "anthropic" then
-    request.system = systemPrompt
-    request.max_tokens = tonumber(trimText(providerSettings.maxTokens)) or client.maxTokens or 1024
-  end
-
-  currentTask = client:chat(request)
-  local taskRef = currentTask
-
-  async(function()
-    local result, err, extra = async.await(taskRef)
-    if taskRef ~= currentTask then
-      return
+  currentTask = async(function()
+    local plan, planErr = async.await(chat:plan(prompt, {
+      timeout = 120,
+      max_tokens = tonumber(trimText(providerSettings.maxTokens))
+    }))
+    if type(plan) == "table" then
+      debugState.lastPlanText = safeJson(plan)
+      debugState.lastPlanError = ""
+    else
+      debugState.lastPlanText = ""
+      debugState.lastPlanError = planErr and tostring(planErr) or ""
     end
+
+    local result, err, extra = async.await(chat:ask(prompt, {
+      timeout = 120,
+      withPlan = false,
+      plan = plan,
+      max_tokens = tonumber(trimText(providerSettings.maxTokens))
+    }))
+
     currentTask = nil
-    if extra == "stopped" then
-      statusText = "stopped"
-      return
-    end
-    if extra == "errored" then
-      statusText = "errored"
-      errorText = tostring(err)
-      return
-    end
+    pendingTurn = nil
+
     if type(result) ~= "table" then
+      if shouldRetryWithRawChat(err, extra) then
+        local fallbackResult, fallbackErr, fallbackExtra = runRawChatFallback(prompt, provider, providerSettings)
+        if type(fallbackResult) == "table" then
+          local reply = tostring(fallbackResult.text or "")
+          if reply == "" then
+            reply = "<empty response>"
+          end
+          chat:add("user", prompt)
+          chat:add("assistant", reply)
+          local _, memoryErr = async.await(chat:runMemoryExtraction(prompt, reply, {
+            history = chat:getHistory()
+          }))
+          debugState.lastMemoryError = memoryErr and tostring(memoryErr) or ""
+          debugState.lastAnswer = reply
+          syncHistoryFromSession()
+          appendTurnStats(prompt, reply, fallbackResult.usage)
+          saveSessionState()
+          statusText = "ok via raw fallback (" .. tostring(provider) .. " / " .. tostring(model) .. ")"
+          errorText = ""
+          return
+        end
+        err = fallbackErr or err
+        extra = fallbackExtra or extra
+      end
+
       local statusCode = type(extra) == "table" and extra.status or 0
       statusText = "failed (status: " .. tostring(statusCode) .. ")"
-      errorText = tostring(err)
+      errorText = formatRequestError(err, extra)
+      syncHistoryFromSession()
+      saveSessionState()
       return
     end
-    local reply = tostring(result.text or "")
-    if reply == "" then
-      reply = "<empty response>"
-    end
-    appendMessage("assistant", reply, {
-      provider = provider,
-      model = model,
-      usage = result.usage
-    })
+
+    debugState.lastMemoryError = tostring(result.memoryError or "")
+    debugState.lastAnswer = tostring(result.text or "")
+    syncHistoryFromSession()
+    appendTurnStats(prompt, result.text or "", result.raw and result.raw.usage or nil)
+    saveSessionState()
     statusText = "ok (" .. tostring(provider) .. " / " .. tostring(model) .. ")"
     errorText = ""
   end)
@@ -685,15 +1257,19 @@ local function layoutMessages(viewportWidth)
   local bubblePaddingY = 12
   local metaLineHeight = ui.fonts.small:getHeight() + 2
   local lineHeight = ui.fonts.body:getHeight() + 4
+  local footerLineHeight = ui.fonts.small:getHeight() + 2
   local cursorY = 6
 
-  local function pushItem(role, text, provider, model, isPending)
+  local function pushItem(role, text, provider, model, isPending, historyIndex)
     local content = tostring(text or "")
     local maxTextWidth = bubbleMaxWidth - bubblePaddingX * 2
     local lines = wrappedLines(ui.fonts.body, content, maxTextWidth)
     local bubbleWidth = computeBubbleWidth(lines, bubbleMinWidth, bubbleMaxWidth)
     local textWidth = bubbleWidth - bubblePaddingX * 2
     lines = wrappedLines(ui.fonts.body, content, textWidth)
+    local copyEnabled = not isPending and content ~= ""
+    local copyButtonW = copyEnabled and 48 or 0
+    local labelTextWidth = math.max(80, textWidth - (copyEnabled and (copyButtonW + 8) or 0))
     local label = role == "user" and "You" or "Assistant"
     if provider and provider ~= "" then
       label = label .. " • " .. tostring(provider)
@@ -704,9 +1280,10 @@ local function layoutMessages(viewportWidth)
     if isPending then
       label = label .. " • waiting"
     end
-    local labelLines = wrappedLines(ui.fonts.small, label, textWidth)
+    local labelLines = wrappedLines(ui.fonts.small, label, labelTextWidth)
     local labelHeight = #labelLines * metaLineHeight
-    local bubbleHeight = bubblePaddingY * 2 + labelHeight + 8 + #lines * lineHeight
+    local tokenLine = isPending and "tokens pending" or tokenLineForMessage(historyIndex, { content = content })
+    local bubbleHeight = bubblePaddingY * 2 + labelHeight + 8 + #lines * lineHeight + 10 + footerLineHeight
     local alignRight = role == "user"
     items[#items + 1] = {
       role = role,
@@ -721,18 +1298,25 @@ local function layoutMessages(viewportWidth)
       h = bubbleHeight,
       lines = lines,
       labelLines = labelLines,
-      labelHeight = labelHeight
+      labelHeight = labelHeight,
+      copyEnabled = copyEnabled,
+      copyButtonW = copyButtonW,
+      tokenLine = tokenLine
     }
     cursorY = cursorY + bubbleHeight + 16
   end
 
   for index = 1, #history do
     local item = history[index]
-    pushItem(item.role, item.content, item.provider, item.model, false)
+    pushItem(item.role, item.content, item.provider, item.model, false, index)
+  end
+
+  if pendingTurn and pendingTurn.goal then
+    pushItem("user", pendingTurn.goal, pendingTurn.provider, pendingTurn.model, false, #history + 1)
   end
 
   if isBusy() then
-    pushItem("assistant", "Thinking...", currentProvider, activeModel(), true)
+    pushItem("assistant", "Thinking...", currentProvider, activeModel(), true, #history + 2)
   end
 
   return items, cursorY
@@ -807,11 +1391,21 @@ local function refreshLayout()
     config = {
       w = math.min(fullWidth - 40, 860),
       h = math.min(screenHeight - 80, 620)
+    },
+    debug = {
+      w = math.min(fullWidth - 20, 980),
+      h = math.min(screenHeight - 60, 760)
     }
   }
 
   ui.layout.config.x = math.floor((screenWidth - ui.layout.config.w) / 2)
   ui.layout.config.y = math.floor((screenHeight - ui.layout.config.h) / 2)
+  ui.layout.debug.x = math.floor((screenWidth - ui.layout.debug.w) / 2)
+  ui.layout.debug.y = math.floor((screenHeight - ui.layout.debug.h) / 2)
+  debugState.layout.x = ui.layout.debug.x
+  debugState.layout.y = ui.layout.debug.y
+  debugState.layout.w = ui.layout.debug.w
+  debugState.layout.h = ui.layout.debug.h
 
   if inputBox then
     inputBox:setRect(
@@ -837,9 +1431,10 @@ local function refreshLayout()
       apiKey = { x = fieldX, y = cursorY, w = fieldW, h = 48 },
       baseUrl = { x = fieldX, y = cursorY + (48 + labelGap + fieldGap), w = fieldW, h = 48 },
       model = { x = fieldX, y = cursorY + (48 + labelGap + fieldGap) * 2, w = fieldW, h = 48 },
-      maxTokens = { x = fieldX, y = cursorY + (48 + labelGap + fieldGap) * 3, w = fieldW, h = 48 }
+      maxTokens = { x = fieldX, y = cursorY + (48 + labelGap + fieldGap) * 3, w = fieldW, h = 48 },
+      contextWindow = { x = fieldX, y = cursorY + (48 + labelGap + fieldGap) * 4, w = fieldW, h = 48 }
     }
-    local promptY = configState.layout.fields.maxTokens.y + 48 + labelGap + fieldGap
+    local promptY = configState.layout.fields.contextWindow.y + 48 + labelGap + fieldGap
     local promptH = modal.y + modal.h - 84 - promptY
     configState.layout.fields.systemPrompt = { x = fieldX, y = promptY, w = fieldW, h = math.max(88, promptH) }
     configState.layout.actions = {
@@ -870,25 +1465,30 @@ local function drawHeader()
   local providerLabel = "provider: " .. tostring(activeProviderLabel())
   local modelLabel = "model: " .. tostring(activeModel())
   local messageLabel = "messages: " .. tostring(#history)
+  local contextLabel = contextUsageLabel()
   local providerWidth = math.max(108, ui.fonts.small:getWidth(providerLabel) + 22)
   local modelWidth = math.max(168, ui.fonts.small:getWidth(modelLabel) + 22)
   local messageWidth = math.max(118, ui.fonts.small:getWidth(messageLabel) + 22)
+  local contextWidth = math.max(148, ui.fonts.small:getWidth(contextLabel) + 22)
   drawPill(providerLabel, infoX, pillY, ui.palette.accent, providerWidth)
   drawPill(modelLabel, infoX + providerWidth + 10, pillY, ui.palette.muted, modelWidth)
   drawPill(messageLabel, infoX + providerWidth + modelWidth + 20, pillY, statusTone(), messageWidth)
+  drawPill(contextLabel, infoX + providerWidth + modelWidth + messageWidth + 30, pillY, ui.palette.warn, contextWidth)
 
   local buttonY = header.y + 20
   local buttonH = 34
   local gap = 10
+  local debugW = 84
   local clearW = 78
   local stopW = 78
   local providerW = 96
   local sendW = 96
-  local startX = header.x + header.w - (sendW + stopW + clearW + providerW + gap * 3) - 20
+  local startX = header.x + header.w - (sendW + stopW + clearW + providerW + debugW + gap * 4) - 20
   drawButton("Provider", startX, buttonY, providerW, buttonH, ui.palette.accent, openProviderConfig, false)
-  drawButton("Clear", startX + providerW + gap, buttonY, clearW, buttonH, ui.palette.warn, clearConversation, false)
-  drawButton("Stop", startX + providerW + clearW + gap * 2, buttonY, stopW, buttonH, ui.palette.danger, cancelCurrent, not isBusy())
-  drawButton("Send", startX + providerW + clearW + stopW + gap * 3, buttonY, sendW, buttonH, ui.palette.success, sendPrompt, isBusy())
+  drawButton("Debug", startX + providerW + gap, buttonY, debugW, buttonH, ui.palette.muted, openDebugPanel, false)
+  drawButton("Clear", startX + providerW + debugW + gap * 2, buttonY, clearW, buttonH, ui.palette.warn, clearConversation, false)
+  drawButton("Stop", startX + providerW + debugW + clearW + gap * 3, buttonY, stopW, buttonH, ui.palette.danger, cancelCurrent, not isBusy())
+  drawButton("Send", startX + providerW + debugW + clearW + stopW + gap * 4, buttonY, sendW, buttonH, ui.palette.success, sendPrompt, isBusy())
 end
 
 local function drawEmptyConversation(chat)
@@ -961,15 +1561,32 @@ local function drawConversation()
             item.labelLines[lineIndex],
             drawX + 14,
             labelY + (lineIndex - 1) * labelLineHeight,
-            item.w - 28,
+            item.w - 28 - (item.copyEnabled and (item.copyButtonW + 8) or 0),
             item.role == "user" and "right" or "left"
           )
+        end
+
+        if item.copyEnabled then
+          local messageIndex = index
+          local copyX = drawX + item.w - item.copyButtonW - 12
+          local copyY = drawY + 10
+          local recentlyCopied = sessionState.copiedMessageIndex == messageIndex and (love.timer and love.timer.getTime and (love.timer.getTime() - sessionState.copiedAt) or 99) < 1.8
+          local copyTone = recentlyCopied and ui.palette.success or ui.palette.muted
+          drawButton(recentlyCopied and "Copied" or "Copy", copyX, copyY, item.copyButtonW, 22, copyTone, function()
+            copyMessageText(item, messageIndex)
+          end, false)
         end
 
         love.graphics.setFont(ui.fonts.body)
         setColor(ui.palette.text)
         local textY = drawY + 14 + item.labelHeight + 8
-        love.graphics.printf(item.text, drawX + 14, textY, item.w - 28, "left")
+        local bodyLineHeight = ui.fonts.body:getHeight() + 4
+        for lineIndex = 1, #item.lines do
+          love.graphics.print(item.lines[lineIndex], drawX + 14, textY + (lineIndex - 1) * bodyLineHeight)
+        end
+        love.graphics.setFont(ui.fonts.small)
+        setColor(ui.palette.muted)
+        love.graphics.printf(item.tokenLine, drawX + 14, drawY + item.h - 18 - ui.fonts.small:getHeight(), item.w - 28, item.role == "user" and "right" or "left")
       end
     end
   end
@@ -987,13 +1604,21 @@ local function drawComposer()
 
   love.graphics.setFont(ui.fonts.small)
   setColor(ui.palette.muted)
-  love.graphics.print("Enter: send   Shift+Enter: newline   F1: clear input   F2: clear chat   F3: provider config   Esc: quit", composer.x + 18, composer.y + 36)
+  love.graphics.print("Enter: send   Shift+Enter: newline   F1: clear input   F2: clear chat   F3: provider config   F4: agent debug   Esc: quit", composer.x + 18, composer.y + 36)
+  local statusX = composer.x + 18
+  local statusY = composer.y + 54
+  local statusGap = 18
+  local rightInfoWidth = math.min(220, math.floor(composer.w * 0.26))
+  local statusWidth = composer.w - 36 - rightInfoWidth - statusGap
   setColor(errorText ~= "" and ui.palette.danger or statusTone())
-  love.graphics.print("status: " .. tostring(statusText ~= "" and statusText or "idle"), composer.x + 18, composer.y + 54)
+  love.graphics.printf("status: " .. tostring(statusText ~= "" and statusText or "idle"), statusX, statusY, statusWidth, "left")
   if errorText ~= "" then
     love.graphics.setFont(ui.fonts.small)
     setColor(ui.palette.danger)
-    love.graphics.printf("error: " .. tostring(firstLine(errorText)), composer.x + 180, composer.y + 54, composer.w - 198, "left")
+    love.graphics.printf("error: " .. tostring(firstLine(errorText)), composer.x + composer.w - 18 - rightInfoWidth, statusY, rightInfoWidth, "right")
+  else
+    setColor(ui.palette.muted)
+    love.graphics.printf(contextRemainLabel(), composer.x + composer.w - 18 - rightInfoWidth, statusY, rightInfoWidth, "right")
   end
 
   if inputBox then
@@ -1027,6 +1652,18 @@ local function drawConfigField(name, label)
   })
 end
 
+local function measureWrappedText(text, width)
+  local _, wrapped = ui.fonts.body:getWrap(tostring(text or ""), width)
+  return math.max(1, #wrapped) * (ui.fonts.body:getHeight() + 3)
+end
+
+local function drawWrappedText(text, x, y, width, color)
+  love.graphics.setFont(ui.fonts.body)
+  setColor(color or ui.palette.text)
+  love.graphics.printf(tostring(text or ""), x, y, width, "left")
+  return measureWrappedText(text, width)
+end
+
 local function drawConfigModal()
   if not configState.isOpen then
     return
@@ -1058,11 +1695,66 @@ local function drawConfigModal()
   drawConfigField("baseUrl", "Base URL")
   drawConfigField("model", "Model")
   drawConfigField("maxTokens", "Max Tokens")
+  drawConfigField("contextWindow", "Context Window")
   drawConfigField("systemPrompt", "System Prompt")
 
   local actions = configState.layout.actions
   drawButton("Cancel", actions.cancel.x, actions.cancel.y, actions.cancel.w, actions.cancel.h, ui.palette.muted, closeProviderConfig, false)
   drawButton("Save", actions.save.x, actions.save.y, actions.save.w, actions.save.h, ui.palette.success, saveProviderConfig, false)
+end
+
+local function drawDebugModal()
+  if not debugState.isOpen then
+    return
+  end
+
+  local modal = debugState.layout
+  local bodyX = modal.x + 20
+  local bodyY = modal.y + 106
+  local bodyW = modal.w - 40
+  local bodyH = modal.h - 132
+  local sections = debugSections()
+  local contentHeight = 0
+
+  for index = 1, #sections do
+    local section = sections[index]
+    contentHeight = contentHeight + 22 + measureWrappedText(section.text, bodyW - 18) + 18
+  end
+
+  debugState.layout.bodyHeight = contentHeight
+  debugState.layout.maxScroll = math.max(0, contentHeight - bodyH)
+  debugState.scroll = clamp(debugState.scroll, 0, debugState.layout.maxScroll)
+
+  setColor({ 0.02, 0.03, 0.05, 0.82 })
+  love.graphics.rectangle("fill", 0, 0, ui.layout.screenWidth, ui.layout.screenHeight)
+  drawPanel(modal.x, modal.y, modal.w, modal.h, ui.palette.panelAlt)
+
+  love.graphics.setFont(ui.fonts.title)
+  setColor(ui.palette.text)
+  love.graphics.print("Agent Debug", modal.x + 20, modal.y + 16)
+  love.graphics.setFont(ui.fonts.small)
+  setColor(ui.palette.muted)
+  love.graphics.print("Visualize planning, memory strategy, extracted durable memory, and raw session state.", modal.x + 22, modal.y + 42)
+
+  local pillY = modal.y + 68
+  drawPill("mode: agent.Session", modal.x + 22, pillY, ui.palette.accent, 152)
+  drawPill("plan: on", modal.x + 184, pillY, ui.palette.success, 92)
+  drawPill("extractor: on", modal.x + 286, pillY, ui.palette.warn, 118)
+  drawPill("route: " .. tostring(debugState.lastRoute or "none"), modal.x + 414, pillY, ui.palette.muted, 148)
+  drawButton("Close", modal.x + modal.w - 108, modal.y + 20, 84, 34, ui.palette.muted, closeDebugPanel, false)
+
+  love.graphics.setScissor(bodyX, bodyY, bodyW, bodyH)
+  local cursorY = bodyY - debugState.scroll
+  for index = 1, #sections do
+    local section = sections[index]
+    love.graphics.setFont(ui.fonts.heading)
+    setColor(ui.palette.text)
+    love.graphics.print(section.title, bodyX, cursorY)
+    cursorY = cursorY + 22
+    cursorY = cursorY + drawWrappedText(section.text, bodyX, cursorY, bodyW - 18, ui.palette.muted) + 18
+  end
+  love.graphics.setScissor()
+  drawVerticalScrollbar(bodyX, bodyY, bodyW, bodyH, debugState.scroll, contentHeight)
 end
 
 function love.load()
@@ -1088,13 +1780,14 @@ function love.load()
 
   ensureConfigEditors()
   loadSettings()
+  loadSessionState()
   rebuildClients()
 
   if not clients.openai and not clients.anthropic then
     statusText = "provider config required"
     errorText = "click Provider to enter and save your API configuration"
   else
-    statusText = "ready"
+    statusText = #history > 0 and ("restored " .. tostring(#history) .. " messages") or "agent session ready"
     errorText = ""
   end
 
@@ -1107,6 +1800,9 @@ function love.update(dt)
 end
 
 function love.textinput(text)
+  if debugState.isOpen then
+    return
+  end
   if configState.isOpen then
     for _, name in ipairs(configState.fieldOrder) do
       local editor = configState.editors[name]
@@ -1138,6 +1834,14 @@ local function isEditorTextEntryKey(key)
 end
 
 function love.keypressed(key)
+  if debugState.isOpen then
+    if key == "escape" or key == "f4" then
+      closeDebugPanel()
+      statusText = "agent debug panel closed"
+      errorText = ""
+      return
+    end
+  end
   if configState.isOpen then
     local shift = love.keyboard.isDown("lshift") or love.keyboard.isDown("rshift")
     local mod = love.keyboard.isDown("lgui") or love.keyboard.isDown("rgui") or love.keyboard.isDown("lctrl") or love.keyboard.isDown("rctrl")
@@ -1207,6 +1911,10 @@ function love.keypressed(key)
     openProviderConfig()
     return
   end
+  if key == "f4" then
+    openDebugPanel()
+    return
+  end
   if key == "c" then
     cancelCurrent()
     return
@@ -1220,6 +1928,9 @@ function love.mousepressed(x, y, button)
       hitbox.onClick()
       return
     end
+  end
+  if debugState.isOpen then
+    return
   end
   if configState.isOpen then
     for _, name in ipairs(configState.fieldOrder) do
@@ -1236,6 +1947,9 @@ function love.mousepressed(x, y, button)
 end
 
 function love.mousemoved(x, y)
+  if debugState.isOpen then
+    return
+  end
   if configState.isOpen then
     for _, name in ipairs(configState.fieldOrder) do
       local editor = configState.editors[name]
@@ -1251,6 +1965,9 @@ function love.mousemoved(x, y)
 end
 
 function love.mousereleased(x, y, button)
+  if debugState.isOpen then
+    return
+  end
   if configState.isOpen then
     for _, name in ipairs(configState.fieldOrder) do
       local editor = configState.editors[name]
@@ -1266,6 +1983,19 @@ function love.mousereleased(x, y, button)
 end
 
 function love.wheelmoved(dx, dy)
+  if debugState.isOpen then
+    local modal = debugState.layout
+    local mx, my = love.mouse.getPosition()
+    local bodyX = modal.x + 20
+    local bodyY = modal.y + 106
+    local bodyW = modal.w - 40
+    local bodyH = modal.h - 132
+    if pointInRect(mx, my, bodyX, bodyY, bodyW, bodyH) and debugState.layout.maxScroll > 0 then
+      local step = (ui.fonts.body:getHeight() + 4) * 3
+      debugState.scroll = clamp(debugState.scroll - dy * step, 0, debugState.layout.maxScroll)
+    end
+    return
+  end
   if configState.isOpen then
     local mx, my = love.mouse.getPosition()
     for _, name in ipairs(configState.fieldOrder) do
@@ -1300,12 +2030,14 @@ function love.draw()
   drawHeader()
   drawConversation()
   drawComposer()
-  if configState.isOpen then
+  if configState.isOpen or debugState.isOpen then
     resetHitboxes()
   end
   drawConfigModal()
+  drawDebugModal()
 end
 
 function love.quit()
+  saveSessionState()
   destroyClients()
 end

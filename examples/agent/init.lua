@@ -1085,10 +1085,21 @@ function Agent:run(goal, opts)
     for step = 1, maxSteps do
       local extra = shallowCopyTable(opts.extra) or {}
       if provider == "openai" then
-        extra.tools = self.registry:openaiTools(toolOpts)
-        extra.tool_choice = extra.tool_choice or "auto"
+        local openaiTools = self.registry:openaiTools(toolOpts)
+        if #openaiTools > 0 then
+          extra.tools = openaiTools
+          extra.tool_choice = extra.tool_choice or "auto"
+        else
+          extra.tools = nil
+          extra.tool_choice = nil
+        end
       else
-        extra.tools = self.registry:anthropicTools(toolOpts)
+        local anthropicTools = self.registry:anthropicTools(toolOpts)
+        if #anthropicTools > 0 then
+          extra.tools = anthropicTools
+        else
+          extra.tools = nil
+        end
       end
 
       trimConversationMessages(messages, provider, maxMessages, keepFirst)
