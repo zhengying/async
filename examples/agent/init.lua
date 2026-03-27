@@ -1110,7 +1110,20 @@ function Agent:run(goal, opts)
         messages = messages,
         system = provider == "anthropic" and systemText or nil,
         extra = extra,
-        timeout = opts.timeout
+        timeout = opts.timeout,
+        stream = opts.stream,
+        onResponse = opts.onResponse,
+        onChunk = opts.onChunk,
+        onEvent = opts.onEvent,
+        onText = function(delta, text, meta)
+          if type(opts.onText) == "function" then
+            local metaOut = type(meta) == "table" and shallowCopyTable(meta) or {}
+            metaOut.step = step
+            metaOut.provider = provider
+            metaOut.goal = goalText
+            opts.onText(delta, text, metaOut)
+          end
+        end
       })
 
       local result, err, extra2 = async.await(task)

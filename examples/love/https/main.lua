@@ -2,8 +2,48 @@ local sourceBase = love.filesystem and love.filesystem.getSourceBaseDirectory an
 if type(sourceBase) ~= "string" then
   sourceBase = "."
 end
-local repoRoot = sourceBase .. "/../../.."
-package.path = repoRoot .. "/?.lua;" .. repoRoot .. "/?/init.lua;" .. package.path
+
+local function fileExists(path)
+  if type(path) ~= "string" or path == "" then
+    return false
+  end
+  local f = io.open(path, "rb")
+  if f then
+    f:close()
+    return true
+  end
+  return false
+end
+
+local function parentDir(path)
+  if type(path) ~= "string" then
+    return nil
+  end
+  path = path:gsub("[/\\]+$", "")
+  local parent = path:match("^(.*)[/\\][^/\\]+$")
+  if parent == "" then
+    return nil
+  end
+  return parent
+end
+
+local function findRepoRoot(startDir)
+  local dir = startDir
+  for _ = 1, 12 do
+    if type(dir) ~= "string" or dir == "" then
+      return nil
+    end
+    if fileExists(dir .. "/async.lua") and fileExists(dir .. "/async_http.lua") then
+      return dir
+    end
+    local p = parentDir(dir)
+    if not p or p == dir then
+      break
+    end
+    dir = p
+  end
+  return nil
+end
 
 local source = love.filesystem and love.filesystem.getSource and love.filesystem.getSource()
 local gameRoot = sourceBase
@@ -17,6 +57,10 @@ if type(source) == "string" and source ~= "" then
     gameRoot = sourceBase .. "/" .. gameRoot
   end
 end
+local workingDir = love.filesystem and love.filesystem.getWorkingDirectory and love.filesystem.getWorkingDirectory()
+local repoRoot = findRepoRoot(gameRoot) or findRepoRoot(sourceBase) or findRepoRoot(workingDir) or gameRoot
+
+package.path = repoRoot .. "/?.lua;" .. repoRoot .. "/?/init.lua;" .. package.path
 package.cpath = gameRoot .. "/?.so;" .. gameRoot .. "/?.dylib;" .. gameRoot .. "/?.dll;" .. package.cpath
 package.cpath = repoRoot .. "/https_libs/?.so;" .. repoRoot .. "/https_libs/?.dylib;" .. repoRoot .. "/https_libs/?.dll;" .. package.cpath
 
@@ -151,6 +195,57 @@ function love.load()
     if not ok or type(mod) ~= "table" or type(mod.request) ~= "function" then
       testFailed = true
       testErrorMsg = "require('https') failed: " .. tostring(mod)
+      love.event.quit()
+      return
+    end
+
+    local code, body = mod.request("https://example.com")
+    if type(code) ~= "number" or code <= 0 or type(body) ~= "string" or body == "" then
+      testFailed = true
+      testErrorMsg = "direct https.request failed: code=" .. tostring(code) .. " body=" .. tostring(body)
+      love.event.quit()
+      return
+    end
+
+    local callbackState = { chunks = {} }
+    local callbackOk, callbackErr = mod.request("https://example.com", {}, {
+      response = function(context, status, headers)
+        context.status = status
+        context.headers = headers
+      end,
+      body = function(context, chunk)
+        context.chunks[#context.chunks + 1] = chunk
+        return true
+      end,
+      complete = function(context, completeErr)
+        context.completeErr = completeErr
+      end
+    }, callbackState)
+
+    if not callbackOk then
+      testFailed = true
+      testErrorMsg = "callback https.request failed: " .. tostring(callbackErr)
+      love.event.quit()
+      return
+    end
+
+    if type(callbackState.status) ~= "number" or callbackState.status <= 0 then
+      testFailed = true
+      testErrorMsg = "callback response missing status"
+      love.event.quit()
+      return
+    end
+
+    if #table.concat(callbackState.chunks) == 0 then
+      testFailed = true
+      testErrorMsg = "callback body was empty"
+      love.event.quit()
+      return
+    end
+
+    if callbackState.completeErr ~= nil then
+      testFailed = true
+      testErrorMsg = "callback complete error: " .. tostring(callbackState.completeErr)
       love.event.quit()
       return
     end

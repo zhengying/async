@@ -133,7 +133,12 @@ local function sendPrompt()
 
   currentTask = client:chatText(inputText, {
     max_tokens = maxTokens,
-    temperature = 0.2
+    temperature = 0.2,
+    stream = true,
+    onText = function(_, text)
+      replyText = tostring(text or "")
+      statusText = "streaming..."
+    end
   })
 
   async(function()

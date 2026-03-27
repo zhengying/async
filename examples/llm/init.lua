@@ -74,6 +74,11 @@ local function debugWriteLines(prefix, payload)
   end
 end
 
+local function emitDebugSink(sink, prefix, payload)
+  local ok = pcall(sink, prefix, payload)
+  return ok
+end
+
 local function isArray(t)
   if type(t) ~= "table" then
     return false
@@ -100,6 +105,102 @@ end
 
 local function jsonEscapeString(s)
   s = tostring(s)
+  local out = {}
+  local i = 1
+  local len = #s
+  local replacement = "\239\191\189"
+
+  local function isContinuation(byte)
+    return byte and byte >= 0x80 and byte <= 0xBF
+  end
+
+  while i <= len do
+    local b1 = s:byte(i)
+    if not b1 then
+      break
+    end
+    if b1 < 0x80 then
+      out[#out + 1] = string.char(b1)
+      i = i + 1
+    elseif b1 >= 0xC2 and b1 <= 0xDF then
+      local b2 = s:byte(i + 1)
+      if isContinuation(b2) then
+        out[#out + 1] = s:sub(i, i + 1)
+        i = i + 2
+      else
+        out[#out + 1] = replacement
+        i = i + 1
+      end
+    elseif b1 == 0xE0 then
+      local b2 = s:byte(i + 1)
+      local b3 = s:byte(i + 2)
+      if b2 and b2 >= 0xA0 and b2 <= 0xBF and isContinuation(b3) then
+        out[#out + 1] = s:sub(i, i + 2)
+        i = i + 3
+      else
+        out[#out + 1] = replacement
+        i = i + 1
+      end
+    elseif (b1 >= 0xE1 and b1 <= 0xEC) or (b1 >= 0xEE and b1 <= 0xEF) then
+      local b2 = s:byte(i + 1)
+      local b3 = s:byte(i + 2)
+      if isContinuation(b2) and isContinuation(b3) then
+        out[#out + 1] = s:sub(i, i + 2)
+        i = i + 3
+      else
+        out[#out + 1] = replacement
+        i = i + 1
+      end
+    elseif b1 == 0xED then
+      local b2 = s:byte(i + 1)
+      local b3 = s:byte(i + 2)
+      if b2 and b2 >= 0x80 and b2 <= 0x9F and isContinuation(b3) then
+        out[#out + 1] = s:sub(i, i + 2)
+        i = i + 3
+      else
+        out[#out + 1] = replacement
+        i = i + 1
+      end
+    elseif b1 == 0xF0 then
+      local b2 = s:byte(i + 1)
+      local b3 = s:byte(i + 2)
+      local b4 = s:byte(i + 3)
+      if b2 and b2 >= 0x90 and b2 <= 0xBF and isContinuation(b3) and isContinuation(b4) then
+        out[#out + 1] = s:sub(i, i + 3)
+        i = i + 4
+      else
+        out[#out + 1] = replacement
+        i = i + 1
+      end
+    elseif b1 >= 0xF1 and b1 <= 0xF3 then
+      local b2 = s:byte(i + 1)
+      local b3 = s:byte(i + 2)
+      local b4 = s:byte(i + 3)
+      if isContinuation(b2) and isContinuation(b3) and isContinuation(b4) then
+        out[#out + 1] = s:sub(i, i + 3)
+        i = i + 4
+      else
+        out[#out + 1] = replacement
+        i = i + 1
+      end
+    elseif b1 == 0xF4 then
+      local b2 = s:byte(i + 1)
+      local b3 = s:byte(i + 2)
+      local b4 = s:byte(i + 3)
+      if b2 and b2 >= 0x80 and b2 <= 0x8F and isContinuation(b3) and isContinuation(b4) then
+        out[#out + 1] = s:sub(i, i + 3)
+        i = i + 4
+      else
+        out[#out + 1] = replacement
+        i = i + 1
+      end
+    else
+      out[#out + 1] = replacement
+      i = i + 1
+    end
+  end
+
+  s = table.concat(out)
   s = s:gsub("\\", "\\\\")
   s = s:gsub("\"", "\\\"")
   s = s:gsub("\b", "\\b")
@@ -545,6 +646,425 @@ local function defaultHeadersForProvider(provider, apiKey, extra)
   return headers
 end
 
+local function appendString(base, extra)
+  if type(extra) ~= "string" or extra == "" then
+    return base
+  end
+  if type(base) ~= "string" or base == "" then
+    return extra
+  end
+  return base .. extra
+end
+
+local function appendTextDelta(streamState, params, delta, meta)
+  if type(delta) ~= "string" or delta == "" then
+    return
+  end
+  streamState.text = appendString(streamState.text, delta) or ""
+  if type(params.onText) == "function" then
+    params.onText(delta, streamState.text, meta)
+  end
+end
+
+local function copyToolCall(call)
+  if type(call) ~= "table" then
+    return nil
+  end
+  local out = {}
+  if type(call.id) == "string" then
+    out.id = call.id
+  end
+  if type(call.type) == "string" then
+    out.type = call.type
+  end
+  if type(call["function"]) == "table" then
+    out["function"] = {}
+    if type(call["function"].name) == "string" then
+      out["function"].name = call["function"].name
+    end
+    if type(call["function"].arguments) == "string" then
+      out["function"].arguments = call["function"].arguments
+    end
+  end
+  return out
+end
+
+local function compactArray(arr, mapper)
+  local out = {}
+  if type(arr) ~= "table" then
+    return out
+  end
+  local maxIndex = 0
+  for k in pairs(arr) do
+    if type(k) == "number" and k > maxIndex then
+      maxIndex = k
+    end
+  end
+  for i = 1, maxIndex do
+    local value = arr[i]
+    if value ~= nil then
+      out[#out + 1] = mapper and mapper(value) or value
+    end
+  end
+  return out
+end
+
+local function createSseParser()
+  return {
+    buffer = "",
+    eventName = nil,
+    dataLines = {}
+  }
+end
+
+local function dispatchSseEvent(parser, fn)
+  if parser.eventName == nil and #parser.dataLines == 0 then
+    return
+  end
+  fn(parser.eventName or "message", table.concat(parser.dataLines, "\n"))
+  parser.eventName = nil
+  parser.dataLines = {}
+end
+
+local function feedSseParser(parser, chunk, fn, flush)
+  if type(chunk) == "string" and chunk ~= "" then
+    parser.buffer = parser.buffer .. chunk
+  end
+
+  while true do
+    local idx = parser.buffer:find("\n", 1, true)
+    if not idx then
+      break
+    end
+    local line = parser.buffer:sub(1, idx - 1)
+    parser.buffer = parser.buffer:sub(idx + 1)
+    if line:sub(-1) == "\r" then
+      line = line:sub(1, -2)
+    end
+    if line == "" then
+      dispatchSseEvent(parser, fn)
+    elseif line:sub(1, 1) ~= ":" then
+      local sep = line:find(":", 1, true)
+      local field = line
+      local value = ""
+      if sep then
+        field = line:sub(1, sep - 1)
+        value = line:sub(sep + 1)
+        if value:sub(1, 1) == " " then
+          value = value:sub(2)
+        end
+      end
+      if field == "event" then
+        parser.eventName = value
+      elseif field == "data" then
+        parser.dataLines[#parser.dataLines + 1] = value
+      end
+    end
+  end
+
+  if flush == true then
+    local tail = parser.buffer
+    if tail:sub(-1) == "\r" then
+      tail = tail:sub(1, -2)
+    end
+    if tail ~= "" then
+      local sep = tail:find(":", 1, true)
+      if sep then
+        local field = tail:sub(1, sep - 1)
+        local value = tail:sub(sep + 1)
+        if value:sub(1, 1) == " " then
+          value = value:sub(2)
+        end
+        if field == "event" then
+          parser.eventName = value
+        elseif field == "data" then
+          parser.dataLines[#parser.dataLines + 1] = value
+        end
+      end
+      parser.buffer = ""
+    end
+    dispatchSseEvent(parser, fn)
+  end
+end
+
+local function accumulateOpenAIStream(streamState, params, eventName, json)
+  if type(json) ~= "table" then
+    return
+  end
+  local state = streamState.providerState
+  state.id = json.id or state.id
+  state.object = json.object or state.object
+  state.model = json.model or state.model
+  state.created = json.created or state.created
+  if type(json.usage) == "table" then
+    state.usage = json.usage
+  end
+
+  local choices = json.choices
+  local first = type(choices) == "table" and choices[1] or nil
+  if type(first) ~= "table" then
+    return
+  end
+
+  if first.finish_reason ~= nil then
+    state.finishReason = first.finish_reason
+  end
+
+  local delta = first.delta
+  if type(delta) ~= "table" then
+    return
+  end
+
+  if type(delta.role) == "string" then
+    state.role = delta.role
+  end
+
+  if type(delta.content) == "string" then
+    appendTextDelta(streamState, params, delta.content, {
+      provider = "openai",
+      event = eventName,
+      json = json
+    })
+  elseif type(delta.content) == "table" then
+    for _, block in ipairs(delta.content) do
+      if type(block) == "table" and type(block.text) == "string" then
+        appendTextDelta(streamState, params, block.text, {
+          provider = "openai",
+          event = eventName,
+          json = json,
+          block = block
+        })
+      end
+    end
+  end
+
+  if type(delta.tool_calls) == "table" then
+    for _, item in ipairs(delta.tool_calls) do
+      if type(item) == "table" then
+        local index = tonumber(item.index)
+        if type(index) == "number" then
+          index = math.floor(index) + 1
+        else
+          index = #state.toolCalls + 1
+        end
+        local toolCall = state.toolCalls[index] or { type = "function", ["function"] = { arguments = "" } }
+        if type(item.id) == "string" then
+          toolCall.id = item.id
+        end
+        if type(item.type) == "string" then
+          toolCall.type = item.type
+        end
+        if type(item["function"]) == "table" then
+          toolCall["function"] = toolCall["function"] or { arguments = "" }
+          if type(item["function"].name) == "string" then
+            toolCall["function"].name = appendString(toolCall["function"].name, item["function"].name)
+          end
+          if type(item["function"].arguments) == "string" then
+            toolCall["function"].arguments = appendString(toolCall["function"].arguments, item["function"].arguments) or ""
+          end
+        end
+        state.toolCalls[index] = toolCall
+      end
+    end
+  end
+end
+
+local function buildOpenAIStreamJson(streamState)
+  local state = streamState.providerState
+  local message = {
+    role = state.role or "assistant"
+  }
+  if type(streamState.text) == "string" and streamState.text ~= "" then
+    message.content = streamState.text
+  end
+
+  local toolCalls = compactArray(state.toolCalls, copyToolCall)
+  if #toolCalls > 0 then
+    message.tool_calls = toolCalls
+  end
+
+  return {
+    id = state.id,
+    object = state.object or "chat.completion",
+    created = state.created,
+    model = state.model,
+    choices = {
+      {
+        index = 0,
+        finish_reason = state.finishReason,
+        message = message
+      }
+    },
+    usage = state.usage
+  }
+end
+
+local function shallowCopyBlock(block)
+  local out = {}
+  if type(block) ~= "table" then
+    return out
+  end
+  for k, v in pairs(block) do
+    if k ~= "_partial_json" then
+      out[k] = v
+    end
+  end
+  return out
+end
+
+local function finalizeAnthropicToolBlock(block)
+  if type(block) ~= "table" then
+    return
+  end
+  if type(block._partial_json) == "string" and block._partial_json ~= "" then
+    local ok, decoded = pcall(jsonDecode, block._partial_json)
+    if ok then
+      block.input = decoded
+    end
+  end
+end
+
+local function accumulateAnthropicStream(streamState, params, eventName, json)
+  if type(json) ~= "table" then
+    return
+  end
+  local state = streamState.providerState
+  local kind = json.type or eventName
+
+  if kind == "message_start" then
+    local message = type(json.message) == "table" and json.message or {}
+    state.id = message.id or state.id
+    state.model = message.model or state.model
+    state.role = message.role or state.role or "assistant"
+    state.stopReason = message.stop_reason or state.stopReason
+    if type(message.usage) == "table" then
+      state.usage = message.usage
+    end
+  elseif kind == "content_block_start" then
+    local index = math.floor(tonumber(json.index) or 0) + 1
+    state.blocks[index] = shallowCopyBlock(json.content_block)
+  elseif kind == "content_block_delta" then
+    local index = math.floor(tonumber(json.index) or 0) + 1
+    local block = state.blocks[index] or {}
+    state.blocks[index] = block
+    local delta = type(json.delta) == "table" and json.delta or {}
+    if delta.type == "text_delta" and type(delta.text) == "string" then
+      block.type = block.type or "text"
+      block.text = appendString(block.text, delta.text) or ""
+      appendTextDelta(streamState, params, delta.text, {
+        provider = "anthropic",
+        event = eventName,
+        json = json,
+        index = index
+      })
+    elseif type(delta.partial_json) == "string" then
+      block.type = block.type or "tool_use"
+      block._partial_json = appendString(block._partial_json, delta.partial_json) or ""
+    end
+  elseif kind == "content_block_stop" then
+    local index = math.floor(tonumber(json.index) or 0) + 1
+    finalizeAnthropicToolBlock(state.blocks[index])
+  elseif kind == "message_delta" then
+    local delta = type(json.delta) == "table" and json.delta or {}
+    if delta.stop_reason ~= nil then
+      state.stopReason = delta.stop_reason
+    end
+    if type(json.usage) == "table" then
+      state.usage = json.usage
+    end
+  elseif kind == "message_stop" then
+    state.stopped = true
+  end
+end
+
+local function buildAnthropicStreamJson(streamState)
+  local state = streamState.providerState
+  local content = compactArray(state.blocks, function(block)
+    finalizeAnthropicToolBlock(block)
+    return shallowCopyBlock(block)
+  end)
+  if #content == 0 and type(streamState.text) == "string" and streamState.text ~= "" then
+    content[1] = {
+      type = "text",
+      text = streamState.text
+    }
+  end
+  return {
+    id = state.id,
+    type = "message",
+    role = state.role or "assistant",
+    model = state.model,
+    content = content,
+    stop_reason = state.stopReason,
+    usage = state.usage
+  }
+end
+
+local function streamStateForProvider(provider)
+  local state = {
+    text = "",
+    parser = createSseParser(),
+    responseStatus = nil,
+    responseHeaders = nil,
+    completeErr = nil
+  }
+  if provider == "openai" then
+    state.providerState = {
+      role = "assistant",
+      toolCalls = {}
+    }
+  else
+    state.providerState = {
+      role = "assistant",
+      blocks = {}
+    }
+  end
+  return state
+end
+
+local function buildStreamJson(provider, streamState)
+  if provider == "openai" then
+    return buildOpenAIStreamJson(streamState)
+  end
+  if provider == "anthropic" then
+    return buildAnthropicStreamJson(streamState)
+  end
+  return nil
+end
+
+local function processStreamEvent(provider, params, streamState, eventName, data)
+  local event = {
+    provider = provider,
+    event = eventName,
+    data = data
+  }
+
+  if data == "[DONE]" then
+    event.done = true
+    if type(params.onEvent) == "function" then
+      params.onEvent(event)
+    end
+    return
+  end
+
+  local ok, decodedOrErr = pcall(jsonDecode, data)
+  if not ok then
+    streamState.parseError = decodedOrErr
+    return
+  end
+
+  event.json = decodedOrErr
+  if type(params.onEvent) == "function" then
+    params.onEvent(event)
+  end
+
+  if provider == "openai" then
+    accumulateOpenAIStream(streamState, params, eventName, decodedOrErr)
+  elseif provider == "anthropic" then
+    accumulateAnthropicStream(streamState, params, eventName, decodedOrErr)
+  end
+end
+
 function Client.new(opts)
   opts = opts or {}
   local provider = normalizeProvider(opts.provider)
@@ -623,6 +1143,10 @@ function Client:chat(params)
     body.temperature = params.temperature
     body.top_p = params.top_p
     body.system = params.system
+    body.stream = params.stream
+    if body.stream == nil then
+      body.stream = false
+    end
     if type(params.extra) == "table" then
       for k, v in pairs(params.extra) do
         body[k] = v
@@ -647,8 +1171,9 @@ function Client:chat(params)
 
   local payload = jsonEncode(body)
   return async(function()
+    local streamState = body.stream and streamStateForProvider(provider) or nil
+    local sink = type(self.debugSink) == "function" and self.debugSink or debugWriteLines
     if self.debug then
-      local sink = type(self.debugSink) == "function" and self.debugSink or debugWriteLines
       local req = {
         provider = provider,
         baseUrl = self.baseUrl,
@@ -657,31 +1182,88 @@ function Client:chat(params)
         headers = redactHeaders(headers),
         body = body
       }
-      sink("request", jsonEncode(req))
+      emitDebugSink(sink, "request", jsonEncode(req))
     end
 
-    local resp, err, extra = async.await(self.http:post(url, payload, { timeout = timeout, headers = headers }))
+    local httpOpts = {
+      timeout = timeout,
+      headers = headers
+    }
+
+    if streamState then
+      httpOpts.stream = true
+      httpOpts.onResponse = function(status, responseHeaders)
+        streamState.responseStatus = status
+        streamState.responseHeaders = responseHeaders
+        if self.debug then
+          emitDebugSink(sink, "response_headers", jsonEncode({
+            provider = provider,
+            url = url,
+            status = status,
+            headers = redactHeaders(responseHeaders)
+          }))
+        end
+        if type(params.onResponse) == "function" then
+          params.onResponse(status, responseHeaders)
+        end
+      end
+      httpOpts.onData = function(chunk)
+        if type(params.onChunk) == "function" then
+          params.onChunk(chunk)
+        end
+        feedSseParser(streamState.parser, chunk, function(eventName, data)
+          processStreamEvent(provider, params, streamState, eventName, data)
+        end, false)
+      end
+      httpOpts.onComplete = function(completeErr)
+        streamState.completeErr = completeErr
+        if self.debug and completeErr ~= nil then
+          emitDebugSink(sink, "stream_complete", jsonEncode({
+            provider = provider,
+            url = url,
+            error = tostring(completeErr)
+          }))
+        end
+      end
+    end
+
+    local resp, err, extra = async.await(self.http:post(url, payload, httpOpts))
     if type(resp) ~= "table" then
       if self.debug then
-        local sink = type(self.debugSink) == "function" and self.debugSink or debugWriteLines
-        sink("response_error", jsonEncode({ provider = provider, url = url, error = tostring(err), extra = extra }))
+        emitDebugSink(sink, "response_error", jsonEncode({ provider = provider, url = url, error = tostring(err), extra = extra }))
       end
       return nil, err, extra
     end
 
     local bodyStr = tostring(resp.body or "")
     if self.debug then
-      local sink = type(self.debugSink) == "function" and self.debugSink or debugWriteLines
       local maxLen = tonumber(self.debugMaxLen) or 200000
       local bodyOut = bodyStr
       if type(maxLen) == "number" and maxLen > 0 and #bodyOut > maxLen then
         bodyOut = bodyOut:sub(1, maxLen)
       end
-      sink("response", jsonEncode({ provider = provider, url = url, status = resp.status, headers = redactHeaders(resp.headers), body = bodyOut }))
+      emitDebugSink(sink, "response", jsonEncode({ provider = provider, url = url, status = resp.status, headers = redactHeaders(resp.headers), body = bodyOut }))
     end
 
-    local ok, decodedOrErr = pcall(jsonDecode, bodyStr)
-    local decoded = ok and decodedOrErr or nil
+    local ok, decodedOrErr
+    local decoded
+    if streamState then
+      feedSseParser(streamState.parser, "", function(eventName, data)
+        processStreamEvent(provider, params, streamState, eventName, data)
+      end, true)
+      decoded = buildStreamJson(provider, streamState)
+      if decoded == nil and streamState.parseError ~= nil then
+        return nil, "stream decode failed: " .. tostring(streamState.parseError), {
+          status = resp.status,
+          headers = resp.headers,
+          body = resp.body
+        }
+      end
+      ok = decoded ~= nil
+    else
+      ok, decodedOrErr = pcall(jsonDecode, bodyStr)
+      decoded = ok and decodedOrErr or nil
+    end
 
     if type(resp.status) ~= "number" or resp.status < 200 or resp.status >= 300 then
       local msg = extractErrorMessage(provider, decoded)
@@ -701,7 +1283,7 @@ function Client:chat(params)
       status = resp.status,
       headers = resp.headers,
       json = decoded,
-      text = self:extractText(decoded),
+      text = streamState and tostring(streamState.text or "") or self:extractText(decoded),
       usage = type(decoded) == "table" and decoded.usage or nil
     }
   end)

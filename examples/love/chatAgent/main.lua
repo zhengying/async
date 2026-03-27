@@ -110,6 +110,19 @@ local debugState = {
   lastGoal = "",
   lastAnswer = "",
   lastRoute = "none",
+  viewer = {
+    isOpen = false,
+    title = "",
+    text = "",
+    rect = {
+      x = 0,
+      y = 0,
+      w = 0,
+      h = 0
+    },
+    copiedAt = 0,
+    editor = nil
+  },
   layout = {
     x = 0,
     y = 0,
@@ -118,6 +131,10 @@ local debugState = {
     bodyHeight = 0,
     maxScroll = 0
   }
+}
+local logState = {
+  entries = {},
+  sequence = 0
 }
 local messageStats = {}
 
@@ -239,10 +256,32 @@ local function copyProviderSettings(value, fallback)
   }
 end
 
+local function defaultLoggingSettings()
+  return {
+    enabled = tostring(os.getenv("CHAT_AGENT_LOG") or "") == "1",
+    level = tostring(os.getenv("CHAT_AGENT_LOG_LEVEL") or "debug"),
+    maxEntries = tonumber(os.getenv("CHAT_AGENT_LOG_MAX_ENTRIES") or "") or 200,
+    maxPayloadChars = tonumber(os.getenv("CHAT_AGENT_LOG_MAX_PAYLOAD_CHARS") or "") or 4000,
+    echoToConsole = tostring(os.getenv("CHAT_AGENT_LOG_ECHO") or "") == "1"
+  }
+end
+
+local function copyLoggingSettings(value, fallback)
+  local defaults = fallback or defaultLoggingSettings()
+  return {
+    enabled = value and value.enabled == true or defaults.enabled == true,
+    level = tostring((value and value.level) or defaults.level or "debug"),
+    maxEntries = tonumber((value and value.maxEntries) or defaults.maxEntries) or 200,
+    maxPayloadChars = tonumber((value and value.maxPayloadChars) or defaults.maxPayloadChars) or 4000,
+    echoToConsole = value and value.echoToConsole == true or defaults.echoToConsole == true
+  }
+end
+
 local function buildDefaultSettings()
   return {
     selectedProvider = "openai",
     systemPrompt = os.getenv("CHAT_AGENT_SYSTEM_PROMPT") or defaultSystemPrompt,
+    logging = copyLoggingSettings(nil, defaultLoggingSettings()),
     providers = {
       openai = copyProviderSettings(nil, defaultProviderSettings("openai")),
       anthropic = copyProviderSettings(nil, defaultProviderSettings("anthropic"))
@@ -255,6 +294,7 @@ local function normalizeSettings(value)
   local normalized = {
     selectedProvider = tostring((value and value.selectedProvider) or defaults.selectedProvider),
     systemPrompt = tostring((value and value.systemPrompt) or defaults.systemPrompt),
+    logging = copyLoggingSettings(value and value.logging, defaults.logging),
     providers = {
       openai = copyProviderSettings(value and value.providers and value.providers.openai, defaults.providers.openai),
       anthropic = copyProviderSettings(value and value.providers and value.providers.anthropic, defaults.providers.anthropic)
@@ -284,6 +324,13 @@ local activeClient
 local activeModel
 local rebuildAgentSession
 local syncMessageStats
+local currentLoggingSettings
+local addLogEntry
+local llmLogSink
+local configureClientLogging
+local applyLoggingConfig
+local sanitizeUtf8Text
+local formatRecentLogs
 
 local function resetHitboxes()
   ui.hitboxes = {}
@@ -427,7 +474,9 @@ end
 
 local function rebuildClients()
   local snapshot = chat and chat:exportState({ includeMetadata = true }) or nil
+  local logging = currentLoggingSettings()
   destroyClients()
+  applyLoggingConfig()
 
   local openai = activeSettingsFor("openai")
   if trimText(openai.apiKey) ~= "" then
@@ -435,10 +484,14 @@ local function rebuildClients()
       apiKey = trimText(openai.apiKey),
       baseUrl = trimText(openai.baseUrl),
       model = trimText(openai.model),
+      debug = logging.enabled,
+      debugMaxLen = logging.maxPayloadChars,
+      debugSink = llmLogSink,
       timeout = 120,
       poolSize = 4,
       httpsModule = "https"
     })
+    configureClientLogging(clients.openai)
   end
 
   local anthropic = activeSettingsFor("anthropic")
@@ -448,10 +501,14 @@ local function rebuildClients()
       baseUrl = trimText(anthropic.baseUrl),
       model = trimText(anthropic.model),
       maxTokens = tonumber(trimText(anthropic.maxTokens)) or 1024,
+      debug = logging.enabled,
+      debugMaxLen = logging.maxPayloadChars,
+      debugSink = llmLogSink,
       timeout = 120,
       poolSize = 4,
       httpsModule = "https"
     })
+    configureClientLogging(clients.anthropic)
   end
 
   local currentSettings = settings or buildDefaultSettings()
@@ -463,6 +520,12 @@ local function rebuildClients()
       currentProvider = "anthropic"
     end
   end
+  addLogEntry("app", "info", "clients_rebuilt", {
+    provider = currentProvider,
+    openai = clients.openai ~= nil,
+    anthropic = clients.anthropic ~= nil,
+    logging = logging
+  })
   rebuildAgentSession(snapshot)
 end
 
@@ -553,6 +616,183 @@ local function saveProviderConfig()
   errorText = ""
 end
 
+local CHAT_LOG_LEVELS = {
+  off = 0,
+  error = 1,
+  warn = 2,
+  info = 3,
+  debug = 4,
+  trace = 5
+}
+
+local CHAT_LOG_LEVEL_ORDER = { "error", "warn", "info", "debug", "trace" }
+
+local function normalizeChatLogLevel(level)
+  if type(level) == "number" then
+    if level <= 0 then
+      return "off"
+    end
+    for i = 1, #CHAT_LOG_LEVEL_ORDER do
+      local name = CHAT_LOG_LEVEL_ORDER[i]
+      if CHAT_LOG_LEVELS[name] == level then
+        return name
+      end
+    end
+    if level > CHAT_LOG_LEVELS.trace then
+      return "trace"
+    end
+    return "info"
+  end
+  if type(level) == "string" then
+    local name = string.lower(level)
+    if CHAT_LOG_LEVELS[name] ~= nil then
+      return name
+    end
+    local asNumber = tonumber(level)
+    if asNumber ~= nil then
+      return normalizeChatLogLevel(asNumber)
+    end
+  end
+  return "info"
+end
+
+currentLoggingSettings = function()
+  local state = settings or buildDefaultSettings()
+  local logging = state.logging or defaultLoggingSettings()
+  logging.level = normalizeChatLogLevel(logging.level)
+  logging.maxEntries = clamp(math.floor(tonumber(logging.maxEntries) or 200), 20, 2000)
+  logging.maxPayloadChars = clamp(math.floor(tonumber(logging.maxPayloadChars) or 4000), 200, 200000)
+  logging.enabled = logging.enabled == true
+  logging.echoToConsole = logging.echoToConsole == true
+  return logging
+end
+
+local function redactLogText(value)
+  local text = tostring(value or "")
+  text = text:gsub("Bearer%s+[%w%-%._~+/=]+", "Bearer <redacted>")
+  text = text:gsub('("apiKey"%s*:%s*")[^"]+(")', '%1<redacted>%2')
+  text = text:gsub('("api_key"%s*:%s*")[^"]+(")', '%1<redacted>%2')
+  text = text:gsub('("x%-api%-key"%s*:%s*")[^"]+(")', '%1<redacted>%2')
+  text = text:gsub('("Authorization"%s*:%s*")Bearer [^"]+(")', '%1Bearer <redacted>%2')
+  return text
+end
+
+sanitizeUtf8Text = function(value)
+  local text = tostring(value or "")
+  local out = {}
+  local i = 1
+  local len = #text
+
+  local function pushByte(byte)
+    out[#out + 1] = string.format("\\x%02X", byte)
+  end
+
+  local function isContinuation(byte)
+    return byte and byte >= 0x80 and byte <= 0xBF
+  end
+
+  while i <= len do
+    local b1 = text:byte(i)
+    if not b1 then
+      break
+    end
+
+    if b1 == 9 or b1 == 10 or b1 == 13 or (b1 >= 32 and b1 <= 126) then
+      out[#out + 1] = string.char(b1)
+      i = i + 1
+    elseif b1 < 0x80 then
+      pushByte(b1)
+      i = i + 1
+    elseif b1 >= 0xC2 and b1 <= 0xDF then
+      local b2 = text:byte(i + 1)
+      if isContinuation(b2) then
+        out[#out + 1] = text:sub(i, i + 1)
+        i = i + 2
+      else
+        pushByte(b1)
+        i = i + 1
+      end
+    elseif b1 == 0xE0 then
+      local b2 = text:byte(i + 1)
+      local b3 = text:byte(i + 2)
+      if b2 and b2 >= 0xA0 and b2 <= 0xBF and isContinuation(b3) then
+        out[#out + 1] = text:sub(i, i + 2)
+        i = i + 3
+      else
+        pushByte(b1)
+        i = i + 1
+      end
+    elseif (b1 >= 0xE1 and b1 <= 0xEC) or (b1 >= 0xEE and b1 <= 0xEF) then
+      local b2 = text:byte(i + 1)
+      local b3 = text:byte(i + 2)
+      if isContinuation(b2) and isContinuation(b3) then
+        out[#out + 1] = text:sub(i, i + 2)
+        i = i + 3
+      else
+        pushByte(b1)
+        i = i + 1
+      end
+    elseif b1 == 0xED then
+      local b2 = text:byte(i + 1)
+      local b3 = text:byte(i + 2)
+      if b2 and b2 >= 0x80 and b2 <= 0x9F and isContinuation(b3) then
+        out[#out + 1] = text:sub(i, i + 2)
+        i = i + 3
+      else
+        pushByte(b1)
+        i = i + 1
+      end
+    elseif b1 == 0xF0 then
+      local b2 = text:byte(i + 1)
+      local b3 = text:byte(i + 2)
+      local b4 = text:byte(i + 3)
+      if b2 and b2 >= 0x90 and b2 <= 0xBF and isContinuation(b3) and isContinuation(b4) then
+        out[#out + 1] = text:sub(i, i + 3)
+        i = i + 4
+      else
+        pushByte(b1)
+        i = i + 1
+      end
+    elseif b1 >= 0xF1 and b1 <= 0xF3 then
+      local b2 = text:byte(i + 1)
+      local b3 = text:byte(i + 2)
+      local b4 = text:byte(i + 3)
+      if isContinuation(b2) and isContinuation(b3) and isContinuation(b4) then
+        out[#out + 1] = text:sub(i, i + 3)
+        i = i + 4
+      else
+        pushByte(b1)
+        i = i + 1
+      end
+    elseif b1 == 0xF4 then
+      local b2 = text:byte(i + 1)
+      local b3 = text:byte(i + 2)
+      local b4 = text:byte(i + 3)
+      if b2 and b2 >= 0x80 and b2 <= 0x8F and isContinuation(b3) and isContinuation(b4) then
+        out[#out + 1] = text:sub(i, i + 3)
+        i = i + 4
+      else
+        pushByte(b1)
+        i = i + 1
+      end
+    else
+      pushByte(b1)
+      i = i + 1
+    end
+  end
+
+  return table.concat(out)
+end
+
+local function clipText(value, maxChars)
+  local text = sanitizeUtf8Text(value)
+  local limit = tonumber(maxChars or 0) or 0
+  if limit > 0 and #text > limit then
+    return text:sub(1, limit) .. "..."
+  end
+  return text
+end
+
 local function safeJson(value)
   local ok, encoded = pcall(llm.jsonEncode, value)
   if ok and type(encoded) == "string" then
@@ -561,13 +801,151 @@ local function safeJson(value)
   return tostring(encoded or value)
 end
 
-local function truncateText(value, maxChars)
-  local text = tostring(value or "")
-  local limit = tonumber(maxChars or 0) or 0
-  if limit > 0 and #text > limit then
-    return text:sub(1, limit) .. "..."
+local function sanitizeLogPayload(value, maxChars)
+  local payload = value
+  if type(value) == "table" then
+    payload = safeJson(value)
   end
-  return text
+  payload = redactLogText(payload)
+  return clipText(sanitizeUtf8Text(payload), maxChars)
+end
+
+addLogEntry = function(source, level, event, fields)
+  local logging = currentLoggingSettings()
+  if not logging.enabled then
+    return
+  end
+
+  local levelName = normalizeChatLogLevel(level)
+  local threshold = CHAT_LOG_LEVELS[logging.level] or CHAT_LOG_LEVELS.info
+  local levelValue = CHAT_LOG_LEVELS[levelName] or CHAT_LOG_LEVELS.info
+  if levelValue > threshold then
+    return
+  end
+
+  logState.sequence = logState.sequence + 1
+  local entry = {
+    id = logState.sequence,
+    time = async.gettime(),
+    source = tostring(source or "app"),
+    level = levelName,
+    event = tostring(event or "event"),
+    payload = sanitizeLogPayload(fields or "", logging.maxPayloadChars)
+  }
+  logState.entries[#logState.entries + 1] = entry
+
+  while #logState.entries > logging.maxEntries do
+    table.remove(logState.entries, 1)
+  end
+
+  if logging.echoToConsole then
+    local line = string.format("[chatAgent][%s][%s][%s] %s", tostring(entry.level), tostring(entry.source), tostring(entry.time), tostring(entry.event))
+    if entry.payload ~= "" then
+      line = line .. " " .. tostring(entry.payload)
+    end
+    print(line)
+  end
+end
+
+llmLogSink = function(prefix, payload)
+  local level = prefix == "response_error" and "error" or "debug"
+  addLogEntry("llm", level, prefix, payload)
+end
+
+local function asyncLogSink(entry)
+  if type(entry) ~= "table" then
+    return
+  end
+  addLogEntry("async", entry.levelName or entry.level or "info", entry.event or "event", {
+    task = entry.task,
+    fields = entry.fields
+  })
+end
+
+configureClientLogging = function(client)
+  if type(client) ~= "table" then
+    return
+  end
+  local logging = currentLoggingSettings()
+  client.debug = logging.enabled
+  client.debugMaxLen = logging.maxPayloadChars
+  client.debugSink = logging.enabled and llmLogSink or nil
+end
+
+applyLoggingConfig = function()
+  local logging = currentLoggingSettings()
+  settings.logging = logging
+  async.setLogLevel(logging.level)
+  async.setLogSink(logging.enabled and asyncLogSink or nil)
+  async.setLogEnabled(logging.enabled)
+  for _, client in pairs(clients) do
+    configureClientLogging(client)
+  end
+end
+
+local function clearDebugLogs()
+  logState.entries = {}
+  logState.sequence = 0
+end
+
+local function cycleLoggingLevel()
+  local logging = currentLoggingSettings()
+  if logging.level == "off" then
+    logging.level = "error"
+  else
+    local index = 1
+    for i = 1, #CHAT_LOG_LEVEL_ORDER do
+      if CHAT_LOG_LEVEL_ORDER[i] == logging.level then
+        index = i
+        break
+      end
+    end
+    logging.level = CHAT_LOG_LEVEL_ORDER[(index % #CHAT_LOG_LEVEL_ORDER) + 1]
+  end
+  settings.logging = logging
+  applyLoggingConfig()
+  saveSettings()
+  statusText = "logging level: " .. tostring(logging.level)
+  errorText = ""
+  addLogEntry("app", "info", "logging_level_changed", { level = logging.level })
+end
+
+local function toggleLogging()
+  local logging = currentLoggingSettings()
+  logging.enabled = not logging.enabled
+  settings.logging = logging
+  applyLoggingConfig()
+  saveSettings()
+  statusText = logging.enabled and ("logging enabled (" .. tostring(logging.level) .. ")") or "logging disabled"
+  errorText = ""
+  if logging.enabled then
+    addLogEntry("app", "info", "logging_enabled", { level = logging.level })
+  end
+end
+
+formatRecentLogs = function(maxEntries, maxChars)
+  local total = #logState.entries
+  if total == 0 then
+    return "<empty>"
+  end
+  local count = math.min(total, tonumber(maxEntries or total) or total)
+  local startIndex = total - count + 1
+  local parts = {}
+  for i = startIndex, total do
+    local entry = logState.entries[i]
+    parts[#parts + 1] = string.format("#%d [%.3f] [%s] [%s] %s", entry.id, tonumber(entry.time) or 0, tostring(entry.level), tostring(entry.source), tostring(entry.event))
+    if entry.payload ~= "" then
+      parts[#parts + 1] = tostring(entry.payload)
+    end
+    if i < total then
+      parts[#parts + 1] = ""
+    end
+  end
+  return clipText(table.concat(parts, "\n"), maxChars or 12000)
+end
+
+local function truncateText(value, maxChars)
+  return clipText(value, maxChars)
 end
 
 local function syncHistoryFromSession()
@@ -770,6 +1148,7 @@ local function debugSections()
   local workspaceStore = chat and chat:getMemoryStore("workspace") or nil
   local profile = chat and chat:getProfile() or nil
   local extractor = chat and chat:getMemoryExtractor() or nil
+  local logging = currentLoggingSettings()
 
   sections[#sections + 1] = {
     title = "Default Strategy",
@@ -794,6 +1173,8 @@ local function debugSections()
       "model: " .. tostring(activeModel()),
       "history turns: " .. tostring(#history),
       "pending turn: " .. tostring(pendingTurn ~= nil),
+      "logging: " .. (logging.enabled and ("on (" .. tostring(logging.level) .. ")") or "off"),
+      "log entries: " .. tostring(#logState.entries),
       "last route: " .. tostring(debugState.lastRoute or "none"),
       "plan status: " .. (debugState.lastPlanText ~= "" and "available" or (debugState.lastPlanError ~= "" and "error" or "empty")),
       "memory error: " .. (debugState.lastMemoryError ~= "" and debugState.lastMemoryError or "<none>"),
@@ -833,6 +1214,23 @@ local function debugSections()
   }
 
   sections[#sections + 1] = {
+    title = "Logging",
+    text = table.concat({
+      "enabled: " .. tostring(logging.enabled),
+      "level: " .. tostring(logging.level),
+      "maxEntries: " .. tostring(logging.maxEntries),
+      "maxPayloadChars: " .. tostring(logging.maxPayloadChars),
+      "echoToConsole: " .. tostring(logging.echoToConsole),
+      "shortcuts: F5 toggle, F6 level, F7 clear"
+    }, "\n")
+  }
+
+  sections[#sections + 1] = {
+    title = "Recent Logs",
+    text = formatRecentLogs(80, 16000)
+  }
+
+  sections[#sections + 1] = {
     title = "Last Turn",
     text = table.concat({
       "goal:",
@@ -854,8 +1252,66 @@ local function openDebugPanel()
   errorText = ""
 end
 
+local function ensureDebugViewerEditor()
+  if debugState.viewer.editor then
+    return debugState.viewer.editor
+  end
+  local editor = TextInput.new({
+    text = "",
+    placeholder = "Debug text",
+    focused = false,
+    softWrap = true,
+    paddingX = 14,
+    paddingY = 14,
+    lineGap = 4
+  })
+  if ui.fonts and ui.fonts.body then
+    editor:setFont(ui.fonts.body)
+  end
+  debugState.viewer.editor = editor
+  return editor
+end
+
+local function closeDebugTextViewer()
+  debugState.viewer.isOpen = false
+  if debugState.viewer.editor then
+    debugState.viewer.editor:blur()
+  end
+end
+
+local function copyTextToClipboard(text, successLabel)
+  if not love.system or type(love.system.setClipboardText) ~= "function" then
+    statusText = "clipboard unavailable"
+    errorText = ""
+    return false
+  end
+  love.system.setClipboardText(tostring(text or ""))
+  statusText = successLabel or "copied"
+  errorText = ""
+  return true
+end
+
+local function logsClipboardText()
+  local logging = currentLoggingSettings()
+  return formatRecentLogs(logging.maxEntries, math.max(16000, logging.maxPayloadChars * logging.maxEntries))
+end
+
+local function openDebugTextViewer(title, text)
+  local editor = ensureDebugViewerEditor()
+  local content = sanitizeUtf8Text(text)
+  debugState.viewer.isOpen = true
+  debugState.viewer.title = tostring(title or "Viewer")
+  debugState.viewer.text = content
+  editor:setText(content)
+  editor:focus()
+  editor:selectAll()
+  statusText = tostring(title or "viewer") .. " opened"
+  errorText = ""
+end
+
 local function closeDebugPanel()
   debugState.isOpen = false
+  closeDebugTextViewer()
   if inputBox then
     inputBox:focus()
   end
@@ -1021,6 +1477,10 @@ cancelCurrent = function()
   if not currentTask then
     return
   end
+  addLogEntry("app", "warn", "request_cancel", {
+    provider = currentProvider,
+    pendingTurn = pendingTurn
+  })
   if type(currentTask.cancel) == "function" then
     currentTask:cancel()
   else
@@ -1065,12 +1525,32 @@ local function shouldRetryWithRawChat(err, extra)
     return true
   end
   local text = tostring(err or "")
-  return text:find("json decode failed", 1, true) ~= nil
+  if text:find("json decode failed", 1, true) ~= nil then
+    return true
+  end
+  if text:find("plan parse failed", 1, true) ~= nil then
+    return true
+  end
+  if text:find("memory extract parse failed", 1, true) ~= nil then
+    return true
+  end
+  if text:find("max steps reached", 1, true) ~= nil then
+    return true
+  end
+  if text:find("tool stopped", 1, true) ~= nil then
+    return true
+  end
+  return false
 end
 
-local function runRawChatFallback(prompt, provider, providerSettings)
+local function runRawChatFallback(prompt, provider, providerSettings, callbacks)
+  callbacks = callbacks or {}
   local client = activeClient()
   if not client then
+    addLogEntry("app", "error", "fallback_unavailable", {
+      provider = provider,
+      reason = "no client"
+    })
     return nil, "no client", nil
   end
   local messages = buildMessages(provider)
@@ -1083,12 +1563,23 @@ local function runRawChatFallback(prompt, provider, providerSettings)
     messages = messages,
     temperature = 0.5,
     timeout = 120,
-    max_tokens = tonumber(trimText(providerSettings.maxTokens))
+    max_tokens = tonumber(trimText(providerSettings.maxTokens)),
+    stream = true,
+    onText = callbacks.onText,
+    onResponse = callbacks.onResponse,
+    onChunk = callbacks.onChunk,
+    onEvent = callbacks.onEvent
   }
   if provider == "anthropic" then
     request.system = systemPrompt
     request.max_tokens = tonumber(trimText(providerSettings.maxTokens)) or 1024
   end
+  addLogEntry("app", "warn", "fallback_begin", {
+    provider = provider,
+    model = request.model,
+    promptChars = #prompt,
+    historyTurns = #history
+  })
   return async.await(client:chat(request))
 end
 
@@ -1114,7 +1605,9 @@ local function sendPrompt()
   pendingTurn = {
     goal = prompt,
     provider = provider,
-    model = model
+    model = model,
+    answer = "",
+    step = "planning"
   }
   debugState.lastGoal = prompt
   debugState.lastAnswer = ""
@@ -1130,8 +1623,20 @@ local function sendPrompt()
   errorText = ""
   followLatest = true
   local providerSettings = activeSettingsFor(provider)
+  addLogEntry("app", "info", "prompt_submit", {
+    provider = provider,
+    model = model,
+    promptChars = #prompt,
+    promptPreview = truncateText(prompt, 240),
+    historyTurns = #history
+  })
 
   currentTask = async(function()
+    addLogEntry("app", "debug", "plan_begin", {
+      provider = provider,
+      model = model,
+      timeout = 120
+    })
     local plan, planErr = async.await(chat:plan(prompt, {
       timeout = 120,
       max_tokens = tonumber(trimText(providerSettings.maxTokens))
@@ -1139,35 +1644,100 @@ local function sendPrompt()
     if type(plan) == "table" then
       debugState.lastPlanText = safeJson(plan)
       debugState.lastPlanError = ""
+      addLogEntry("app", "info", "plan_success", {
+        provider = provider,
+        steps = #plan
+      })
     else
       debugState.lastPlanText = ""
       debugState.lastPlanError = planErr and tostring(planErr) or ""
+      addLogEntry("app", "warn", "plan_failed", {
+        provider = provider,
+        error = planErr
+      })
     end
 
+    addLogEntry("app", "debug", "ask_begin", {
+      provider = provider,
+      model = model,
+      hasPlan = type(plan) == "table",
+      timeout = 120
+    })
     local result, err, extra = async.await(chat:ask(prompt, {
       timeout = 120,
       withPlan = false,
       plan = plan,
-      max_tokens = tonumber(trimText(providerSettings.maxTokens))
+      max_tokens = tonumber(trimText(providerSettings.maxTokens)),
+      stream = true,
+      onText = function(_, text, meta)
+        if not pendingTurn then
+          return
+        end
+        pendingTurn.answer = tostring(text or "")
+        pendingTurn.step = "streaming"
+        debugState.lastAnswer = pendingTurn.answer
+        statusText = "streaming..."
+        errorText = ""
+        followLatest = true
+        addLogEntry("app", "debug", "stream_text", {
+          provider = provider,
+          model = model,
+          chars = #pendingTurn.answer,
+          step = type(meta) == "table" and meta.step or nil
+        })
+      end
     }))
 
     currentTask = nil
-    pendingTurn = nil
 
     if type(result) ~= "table" then
+      addLogEntry("app", "warn", "ask_failed", {
+        provider = provider,
+        model = model,
+        error = err,
+        extra = extra
+      })
       if shouldRetryWithRawChat(err, extra) then
-        local fallbackResult, fallbackErr, fallbackExtra = runRawChatFallback(prompt, provider, providerSettings)
+        if pendingTurn then
+          pendingTurn.answer = ""
+          pendingTurn.step = "fallback"
+        end
+        local fallbackResult, fallbackErr, fallbackExtra = runRawChatFallback(prompt, provider, providerSettings, {
+          onText = function(_, text)
+            if not pendingTurn then
+              return
+            end
+            pendingTurn.answer = tostring(text or "")
+            pendingTurn.step = "fallback"
+            debugState.lastAnswer = pendingTurn.answer
+            statusText = "streaming fallback..."
+            errorText = ""
+            followLatest = true
+          end
+        })
         if type(fallbackResult) == "table" then
           local reply = tostring(fallbackResult.text or "")
           if reply == "" then
             reply = "<empty response>"
           end
+          addLogEntry("app", "info", "fallback_success", {
+            provider = provider,
+            model = model,
+            replyChars = #reply,
+            usage = fallbackResult.usage
+          })
           chat:add("user", prompt)
           chat:add("assistant", reply)
           local _, memoryErr = async.await(chat:runMemoryExtraction(prompt, reply, {
             history = chat:getHistory()
           }))
           debugState.lastMemoryError = memoryErr and tostring(memoryErr) or ""
+          if memoryErr ~= nil then
+            addLogEntry("app", "warn", "fallback_memory_error", {
+              provider = provider,
+              error = memoryErr
+            })
+          end
           debugState.lastAnswer = reply
           syncHistoryFromSession()
           appendTurnStats(prompt, reply, fallbackResult.usage)
@@ -1176,6 +1746,12 @@ local function sendPrompt()
           errorText = ""
           return
         end
+        addLogEntry("app", "error", "fallback_failed", {
+          provider = provider,
+          model = model,
+          error = fallbackErr,
+          extra = fallbackExtra
+        })
         err = fallbackErr or err
         extra = fallbackExtra or extra
       end
@@ -1183,18 +1759,27 @@ local function sendPrompt()
       local statusCode = type(extra) == "table" and extra.status or 0
       statusText = "failed (status: " .. tostring(statusCode) .. ")"
       errorText = formatRequestError(err, extra)
+      pendingTurn = nil
       syncHistoryFromSession()
       saveSessionState()
       return
     end
 
     debugState.lastMemoryError = tostring(result.memoryError or "")
+    addLogEntry("app", "info", "ask_success", {
+      provider = provider,
+      model = model,
+      replyChars = #(tostring(result.text or "")),
+      usage = result.raw and result.raw.usage or nil,
+      memoryError = result.memoryError
+    })
     debugState.lastAnswer = tostring(result.text or "")
     syncHistoryFromSession()
     appendTurnStats(prompt, result.text or "", result.raw and result.raw.usage or nil)
     saveSessionState()
     statusText = "ok (" .. tostring(provider) .. " / " .. tostring(model) .. ")"
     errorText = ""
+    pendingTurn = nil
   end)
 end
 
@@ -1278,7 +1863,7 @@ local function layoutMessages(viewportWidth)
       label = label .. " • " .. tostring(model)
     end
     if isPending then
-      label = label .. " • waiting"
+      label = label .. " • " .. tostring((pendingTurn and pendingTurn.step) or "waiting")
     end
     local labelLines = wrappedLines(ui.fonts.small, label, labelTextWidth)
     local labelHeight = #labelLines * metaLineHeight
@@ -1316,7 +1901,11 @@ local function layoutMessages(viewportWidth)
   end
 
   if isBusy() then
-    pushItem("assistant", "Thinking...", currentProvider, activeModel(), true, #history + 2)
+    local pendingText = pendingTurn and trimText(pendingTurn.answer) or ""
+    if pendingText == "" then
+      pendingText = "Thinking..."
+    end
+    pushItem("assistant", pendingText, currentProvider, activeModel(), true, #history + 2)
   end
 
   return items, cursorY
@@ -1596,6 +2185,7 @@ end
 
 local function drawComposer()
   local composer = ui.layout.composer
+  local logging = currentLoggingSettings()
   drawPanel(composer.x, composer.y, composer.w, composer.h, ui.palette.panelAlt)
 
   love.graphics.setFont(ui.fonts.heading)
@@ -1604,7 +2194,7 @@ local function drawComposer()
 
   love.graphics.setFont(ui.fonts.small)
   setColor(ui.palette.muted)
-  love.graphics.print("Enter: send   Shift+Enter: newline   F1: clear input   F2: clear chat   F3: provider config   F4: agent debug   Esc: quit", composer.x + 18, composer.y + 36)
+  love.graphics.print("Enter: send   Shift+Enter: newline   F1: clear input   F2: clear chat   F3: provider config   F4: agent debug   F5: logs on/off   F6: log level   F7: clear logs   Esc: quit", composer.x + 18, composer.y + 36)
   local statusX = composer.x + 18
   local statusY = composer.y + 54
   local statusGap = 18
@@ -1618,7 +2208,7 @@ local function drawComposer()
     love.graphics.printf("error: " .. tostring(firstLine(errorText)), composer.x + composer.w - 18 - rightInfoWidth, statusY, rightInfoWidth, "right")
   else
     setColor(ui.palette.muted)
-    love.graphics.printf(contextRemainLabel(), composer.x + composer.w - 18 - rightInfoWidth, statusY, rightInfoWidth, "right")
+    love.graphics.printf(contextRemainLabel() .. " | logs: " .. (logging.enabled and logging.level or "off"), composer.x + composer.w - 18 - rightInfoWidth, statusY, rightInfoWidth, "right")
   end
 
   if inputBox then
@@ -1653,15 +2243,17 @@ local function drawConfigField(name, label)
 end
 
 local function measureWrappedText(text, width)
-  local _, wrapped = ui.fonts.body:getWrap(tostring(text or ""), width)
+  local displayText = sanitizeUtf8Text(text)
+  local _, wrapped = ui.fonts.body:getWrap(displayText, width)
   return math.max(1, #wrapped) * (ui.fonts.body:getHeight() + 3)
 end
 
 local function drawWrappedText(text, x, y, width, color)
+  local displayText = sanitizeUtf8Text(text)
   love.graphics.setFont(ui.fonts.body)
   setColor(color or ui.palette.text)
-  love.graphics.printf(tostring(text or ""), x, y, width, "left")
-  return measureWrappedText(text, width)
+  love.graphics.printf(displayText, x, y, width, "left")
+  return measureWrappedText(displayText, width)
 end
 
 local function drawConfigModal()
@@ -1741,6 +2333,14 @@ local function drawDebugModal()
   drawPill("plan: on", modal.x + 184, pillY, ui.palette.success, 92)
   drawPill("extractor: on", modal.x + 286, pillY, ui.palette.warn, 118)
   drawPill("route: " .. tostring(debugState.lastRoute or "none"), modal.x + 414, pillY, ui.palette.muted, 148)
+  drawButton("Copy Logs", modal.x + modal.w - 324, modal.y + 20, 92, 34, ui.palette.accent, function()
+    if copyTextToClipboard(logsClipboardText(), "logs copied") then
+      debugState.viewer.copiedAt = love.timer and love.timer.getTime and love.timer.getTime() or 0
+    end
+  end, false)
+  drawButton("Select Logs", modal.x + modal.w - 224, modal.y + 20, 100, 34, ui.palette.success, function()
+    openDebugTextViewer("Recent Logs", logsClipboardText())
+  end, false)
   drawButton("Close", modal.x + modal.w - 108, modal.y + 20, 84, 34, ui.palette.muted, closeDebugPanel, false)
 
   love.graphics.setScissor(bodyX, bodyY, bodyW, bodyH)
@@ -1755,6 +2355,48 @@ local function drawDebugModal()
   end
   love.graphics.setScissor()
   drawVerticalScrollbar(bodyX, bodyY, bodyW, bodyH, debugState.scroll, contentHeight)
+
+  if debugState.viewer.isOpen then
+    local viewer = debugState.viewer
+    local viewerX = modal.x + 36
+    local viewerY = modal.y + 88
+    local viewerW = modal.w - 72
+    local viewerH = modal.h - 124
+    viewer.rect.x = viewerX
+    viewer.rect.y = viewerY
+    viewer.rect.w = viewerW
+    viewer.rect.h = viewerH
+
+    setColor({ 0.01, 0.02, 0.04, 0.92 })
+    love.graphics.rectangle("fill", viewerX, viewerY, viewerW, viewerH, 16, 16)
+    setColor(ui.palette.border)
+    love.graphics.rectangle("line", viewerX, viewerY, viewerW, viewerH, 16, 16)
+
+    love.graphics.setFont(ui.fonts.heading)
+    setColor(ui.palette.text)
+    love.graphics.print(viewer.title, viewerX + 18, viewerY + 16)
+    love.graphics.setFont(ui.fonts.small)
+    setColor(ui.palette.muted)
+    love.graphics.print("Select text with mouse. Use Cmd/Ctrl+A and Cmd/Ctrl+C to copy.", viewerX + 20, viewerY + 42)
+
+    drawButton("Copy", viewerX + viewerW - 196, viewerY + 14, 72, 30, ui.palette.accent, function()
+      copyTextToClipboard(viewer.text, "viewer text copied")
+    end, false)
+    drawButton("Close", viewerX + viewerW - 112, viewerY + 14, 80, 30, ui.palette.muted, closeDebugTextViewer, false)
+
+    local editor = ensureDebugViewerEditor()
+    editor:setRect(viewerX + 18, viewerY + 72, viewerW - 36, viewerH - 90)
+    editor:draw({
+      bg = ui.palette.panel,
+      border = ui.palette.border,
+      accent = ui.palette.accent,
+      text = ui.palette.text,
+      muted = ui.palette.muted,
+      selection = { ui.palette.accent[1], ui.palette.accent[2], ui.palette.accent[3], 0.24 },
+      cursor = ui.palette.accent,
+      placeholder = ui.palette.muted
+    })
+  end
 end
 
 function love.load()
@@ -1777,9 +2419,14 @@ function love.load()
   })
   inputBox:setFont(ui.fonts.body)
   inputBox:focus()
+  ensureDebugViewerEditor()
 
   ensureConfigEditors()
   loadSettings()
+  applyLoggingConfig()
+  addLogEntry("app", "info", "love_load", {
+    logging = currentLoggingSettings()
+  })
   loadSessionState()
   rebuildClients()
 
@@ -1833,8 +2480,37 @@ local function isEditorTextEntryKey(key)
   return false
 end
 
+local function isDebugViewerKeyAllowed(key)
+  if type(key) ~= "string" then
+    return false
+  end
+  if key == "left" or key == "right" or key == "up" or key == "down" then
+    return true
+  end
+  if key == "home" or key == "end" or key == "pageup" or key == "pagedown" then
+    return true
+  end
+  if key == "a" or key == "c" then
+    return true
+  end
+  return false
+end
+
 function love.keypressed(key)
   if debugState.isOpen then
+    if debugState.viewer.isOpen then
+      if key == "escape" then
+        closeDebugTextViewer()
+        statusText = "debug text viewer closed"
+        errorText = ""
+        return
+      end
+      local editor = debugState.viewer.editor
+      if editor and isDebugViewerKeyAllowed(key) and editor:keypressed(key) then
+        return
+      end
+      return
+    end
     if key == "escape" or key == "f4" then
       closeDebugPanel()
       statusText = "agent debug panel closed"
@@ -1915,6 +2591,20 @@ function love.keypressed(key)
     openDebugPanel()
     return
   end
+  if key == "f5" then
+    toggleLogging()
+    return
+  end
+  if key == "f6" then
+    cycleLoggingLevel()
+    return
+  end
+  if key == "f7" then
+    clearDebugLogs()
+    statusText = "logs cleared"
+    errorText = ""
+    return
+  end
   if key == "c" then
     cancelCurrent()
     return
@@ -1930,6 +2620,9 @@ function love.mousepressed(x, y, button)
     end
   end
   if debugState.isOpen then
+    if debugState.viewer.isOpen and debugState.viewer.editor and debugState.viewer.editor:mousepressed(x, y, button) then
+      return
+    end
     return
   end
   if configState.isOpen then
@@ -1948,6 +2641,9 @@ end
 
 function love.mousemoved(x, y)
   if debugState.isOpen then
+    if debugState.viewer.isOpen and debugState.viewer.editor then
+      debugState.viewer.editor:mousemoved(x, y)
+    end
     return
   end
   if configState.isOpen then
@@ -1966,6 +2662,9 @@ end
 
 function love.mousereleased(x, y, button)
   if debugState.isOpen then
+    if debugState.viewer.isOpen and debugState.viewer.editor then
+      debugState.viewer.editor:mousereleased(x, y, button)
+    end
     return
   end
   if configState.isOpen then
@@ -1984,6 +2683,14 @@ end
 
 function love.wheelmoved(dx, dy)
   if debugState.isOpen then
+    if debugState.viewer.isOpen and debugState.viewer.editor then
+      local viewer = debugState.viewer.rect
+      local mx, my = love.mouse.getPosition()
+      if pointInRect(mx, my, viewer.x, viewer.y, viewer.w, viewer.h) then
+        debugState.viewer.editor:wheelmoved(dx, dy)
+        return
+      end
+    end
     local modal = debugState.layout
     local mx, my = love.mouse.getPosition()
     local bodyX = modal.x + 20

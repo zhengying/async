@@ -404,6 +404,62 @@ end
 do
   harness.reset()
 
+  local captured = {}
+  local deltas = {}
+  local snapshots = {}
+  local client = {
+    provider = "openai",
+    chat = function(_, params)
+      captured[#captured + 1] = params
+      return async(function()
+        if type(params.onText) == "function" then
+          params.onText("Hel", "Hel", { provider = "openai" })
+          params.onText("lo", "Hello", { provider = "openai" })
+        end
+        return {
+          text = "Hello",
+          json = { choices = { { message = { role = "assistant", content = "Hello" } } } }
+        }
+      end)
+    end
+  }
+
+  local session = agent.Session.new({
+    agent = agent.Agent.new({
+      client = client,
+      withPlan = false
+    })
+  })
+
+  local task = async(function()
+    local result = async.await(session:ask("Say hello", {
+      stream = true,
+      onText = function(delta, text, meta)
+        deltas[#deltas + 1] = delta
+        snapshots[#snapshots + 1] = {
+          text = text,
+          step = meta and meta.step or nil,
+          provider = meta and meta.provider or nil
+        }
+      end
+    }))
+    T.assertEq(result.text, "Hello")
+  end)
+  local ok, err = harness.runUntil(function()
+    return task.result ~= nil or task.error ~= nil
+  end, { maxSteps = 1000 })
+  T.assertTrue(ok, err)
+  T.assertTrue(task.error == nil, tostring(task.error))
+  T.assertEq(captured[1].stream, true, "session ask should enable client streaming")
+  T.assertEq(table.concat(deltas), "Hello", "session ask should forward streamed deltas")
+  T.assertEq(snapshots[#snapshots].text, "Hello", "session ask should forward the latest streamed text")
+  T.assertEq(snapshots[1].step, 1, "session ask should annotate stream step")
+  T.assertEq(snapshots[1].provider, "openai", "session ask should annotate provider")
+end
+
+do
+  harness.reset()
+
   local client = {
     provider = "openai",
     chat = function()

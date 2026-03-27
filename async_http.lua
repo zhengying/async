@@ -19,6 +19,18 @@ local function shallowCopyTable(t)
   return out
 end
 
+local function addHandler(list, fn)
+  if type(fn) == "function" then
+    list[#list + 1] = fn
+  end
+end
+
+local function emitHandlers(list, ...)
+  for i = 1, #list do
+    list[i](...)
+  end
+end
+
 local function urlEncode(s)
   s = tostring(s)
   s = s:gsub("\n", "\r\n")
@@ -136,6 +148,19 @@ function AsyncHttp:_ensureRegistered()
   self.pool:register("asynchttp_request", function(payload, ctx)
     local loader = loadstring or load
 
+    local function emitStream(eventName, data)
+      if not (type(payload) == "table" and payload.stream == true) then
+        return
+      end
+      if ctx and type(ctx.progress) == "function" then
+        ctx.progress(0, {
+          type = "http_stream",
+          event = eventName,
+          data = data
+        })
+      end
+    end
+
     if type(payload) == "table" and type(payload.adapterCode) == "string" then
       local requestFn, loadErr = loader(payload.adapterCode)
       if not requestFn then
@@ -146,7 +171,7 @@ function AsyncHttp:_ensureRegistered()
       end
 
       local options = type(payload.options) == "table" and payload.options or nil
-      local ok, code, body, headers = pcall(requestFn, payload.url, options)
+      local ok, code, body, headers = pcall(requestFn, payload.url, options, emitStream)
       if not ok then
         return nil, "adapter error: " .. tostring(code)
       end
@@ -195,7 +220,56 @@ function AsyncHttp:_ensureRegistered()
     end
 
     local code, body, headers
-    if options then
+    if payload.stream == true then
+      local state = {
+        status = 0,
+        headers = nil,
+        chunks = {},
+        completeErr = nil
+      }
+      local callbacks = {
+        response = function(context, status, responseHeaders)
+          context.status = tonumber(status) or 0
+          context.headers = responseHeaders or {}
+          emitStream("response", {
+            status = context.status,
+            headers = context.headers
+          })
+        end,
+        body = function(context, chunk)
+          chunk = tostring(chunk or "")
+          context.chunks[#context.chunks + 1] = chunk
+          emitStream("body", { chunk = chunk })
+          return true
+        end,
+        complete = function(context, completeErr)
+          context.completeErr = completeErr
+          emitStream("complete", { err = completeErr })
+        end
+      }
+
+      local ok, err = https.request(payload.url, options or {}, callbacks, state)
+      if not ok then
+        local failedBody = table.concat(state.chunks)
+        return nil, tostring(err or "request failed"), {
+          status = tonumber(state.status) or 0,
+          body = failedBody,
+          headers = state.headers or {}
+        }
+      end
+
+      code = tonumber(state.status) or 0
+      body = table.concat(state.chunks)
+      headers = state.headers or {}
+
+      if state.completeErr ~= nil then
+        return nil, tostring(state.completeErr), {
+          status = code,
+          body = body,
+          headers = headers
+        }
+      end
+    elseif options then
       code, body, headers = https.request(payload.url, options)
     else
       code, body = https.request(payload.url)
@@ -273,7 +347,31 @@ function AsyncHttp:request(req)
     options.headers = headers
   end
 
-  local payload = { url = url, options = options, httpsModule = self.httpsModule }
+  local streamHandlers = {
+    response = {},
+    body = {},
+    complete = {}
+  }
+  addHandler(streamHandlers.response, req.onResponse)
+  addHandler(streamHandlers.body, req.onData)
+  addHandler(streamHandlers.body, req.onBody)
+  addHandler(streamHandlers.complete, req.onComplete)
+  if type(req.stream) == "table" then
+    addHandler(streamHandlers.response, req.stream.response)
+    addHandler(streamHandlers.body, req.stream.body)
+    addHandler(streamHandlers.complete, req.stream.complete)
+  end
+  local wantsStream = req.stream == true
+    or #streamHandlers.response > 0
+    or #streamHandlers.body > 0
+    or #streamHandlers.complete > 0
+
+  local payload = {
+    url = url,
+    options = options,
+    httpsModule = self.httpsModule,
+    stream = wantsStream
+  }
   if self._adapterCode then
     payload.adapterCode = self._adapterCode
   end
@@ -283,7 +381,45 @@ function AsyncHttp:request(req)
   end
 
   async.log("debug", "http_request_submit", { url = url, method = method, timeout = timeout })
-  return self.pool:submit("asynchttp_request", payload, { timeout = timeout })
+  local task = self.pool:submit("asynchttp_request", payload, { timeout = timeout })
+
+  if wantsStream then
+    task:onProgress(function(_, packet)
+      if type(packet) ~= "table" or packet.type ~= "http_stream" then
+        return
+      end
+      local dataPacket = type(packet.data) == "table" and packet.data or {}
+      if packet.event == "response" then
+        emitHandlers(streamHandlers.response, dataPacket.status, dataPacket.headers or {})
+      elseif packet.event == "body" then
+        emitHandlers(streamHandlers.body, tostring(dataPacket.chunk or ""))
+      elseif packet.event == "complete" then
+        emitHandlers(streamHandlers.complete, dataPacket.err)
+      end
+    end)
+  end
+
+  function task:onResponse(fn)
+    addHandler(streamHandlers.response, fn)
+    return task
+  end
+
+  function task:onData(fn)
+    addHandler(streamHandlers.body, fn)
+    return task
+  end
+
+  function task:onBody(fn)
+    addHandler(streamHandlers.body, fn)
+    return task
+  end
+
+  function task:onComplete(fn)
+    addHandler(streamHandlers.complete, fn)
+    return task
+  end
+
+  return task
 end
 
 function AsyncHttp:get(url, opts)

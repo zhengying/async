@@ -21,6 +21,7 @@ local files = {
   rootDir .. "/testcases/test_async_await_waitfor.lua",
   rootDir .. "/testcases/test_async_promises.lua",
   rootDir .. "/testcases/test_threadpool.lua",
+  rootDir .. "/testcases/test_llm.lua",
   rootDir .. "/testcases/test_agent.lua"
 }
 

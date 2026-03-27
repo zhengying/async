@@ -72,7 +72,7 @@ local function threadFile()
   return "thread_worker.lua"
 end
 
-local function httpAdapter(url, options)
+local function httpAdapter(url, options, emit)
   options = options or {}
 
   local method = tostring(options.method or "GET")
@@ -97,6 +97,19 @@ local function httpAdapter(url, options)
       love.timer.sleep(0.2)
     end
     return 200, "slow", responseHeaders
+  end
+
+  if tostring(url or ""):find("/stream", 1, true) then
+    if type(emit) == "function" then
+      emit("response", {
+        status = 200,
+        headers = responseHeaders
+      })
+      emit("body", { chunk = "hel" })
+      emit("body", { chunk = "lo" })
+      emit("complete", { err = nil })
+    end
+    return 200, "hello", responseHeaders
   end
 
   local body = {
@@ -343,6 +356,51 @@ function love.load()
     assertTrue(gotErr == nil, "unexpected error: " .. tostring(gotErr))
     assertTrue(type(gotResp) == "table", "expected response table")
     assertEq(gotResp.status, 200, "status mismatch")
+
+    client:destroy()
+  end)
+
+  runTest("AsyncHttp stream callbacks receive response chunks", function()
+    async.clear()
+
+    local client = AsyncHttp.new({
+      poolSize = 1,
+      baseUrl = "https://unit.test/api",
+      timeout = 2,
+      adapter = httpAdapter
+    })
+
+    local responseStatus = nil
+    local responseHeader = nil
+    local chunks = {}
+    local completeErr = "pending"
+    local result = nil
+
+    async(function()
+      local task = client:get("/stream", {
+        stream = true,
+        onResponse = function(status, headers)
+          responseStatus = status
+          responseHeader = headers and headers["X-Mock"] or nil
+        end
+      })
+      task:onData(function(chunk)
+        chunks[#chunks + 1] = chunk
+      end)
+      task:onComplete(function(err)
+        completeErr = err
+      end)
+      result = async.await(task)
+    end)
+
+    runFrames(5)
+
+    assertEq(responseStatus, 200, "stream response status mismatch")
+    assertEq(responseHeader, "1", "stream response header mismatch")
+    assertEq(table.concat(chunks), "hello", "stream chunks mismatch")
+    assertEq(completeErr, nil, "stream complete error mismatch")
+    assertTrue(type(result) == "table", "stream result should be a table")
+    assertEq(result.body, "hello", "stream final body mismatch")
 
     client:destroy()
   end)
