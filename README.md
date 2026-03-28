@@ -5,6 +5,8 @@ This repository provides:
 - `async.lua`: a cooperative coroutine scheduler with `sleep`, `await`, timeouts, cancellation, and promise-style helpers.
 - `threadpool.lua`: a LÖVE-only thread pool that integrates with `async.lua` (submit/await, progress callbacks, cancel).
 
+For `threadpool.lua`, worker threads inherit the main thread's `package.path` and `package.cpath` at pool creation time. Set those search paths before calling `ThreadPool.new(...)` if your workers need to `require(...)` project modules or native libraries.
+
 ## Quickstart (LÖVE)
 
 Drop `async.lua` into your project and call the scheduler once per frame.
@@ -64,4 +66,3 @@ If LÖVE is not installed at the default path, set `LOVE_BIN`:
 ```bash
 LOVE_BIN=love luajit testcases/run.lua
 ```
-

@@ -441,6 +441,9 @@ end)
 - The worker function is serialized with `string.dump(fn)` and loaded in a worker thread. This means:
   - `fn` must be dumpable (avoid C closures / functions provided by native modules).
   - avoid relying on upvalues; prefer passing everything in `payload`.
+- Worker threads inherit the main thread's `package.path` and `package.cpath` when the pool is created.
+  - Configure your Lua/native module search paths before calling `ThreadPool.new(...)`.
+  - This is the supported way to make worker-side `require(...)` resolve the same project modules and native libraries as the main thread.
 - Progress callbacks run on the main thread during `async.update()` ticks (the pool installs an internal async pump task).
 - Cancellation is cooperative: your worker function must periodically call `ctx.canceled()` to stop early.
 - If your worker does `if ctx.canceled() then return nil, "canceled" end`, that is a normal successful return (not an async error). If you want cancellation to surface as an error/state on the main thread, use `error("canceled")` (or adopt your own tagged-result convention and handle it explicitly).

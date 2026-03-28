@@ -1078,6 +1078,7 @@ function Client.new(opts)
   self.baseUrl = opts.baseUrl
   self.model = opts.model
   self.maxTokens = opts.maxTokens
+  self.contextWindow = tonumber(opts.contextWindow) or nil
   self.timeout = opts.timeout
   self.headers = defaultHeadersForProvider(provider, self.apiKey, opts.headers)
   if opts.debug == nil then

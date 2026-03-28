@@ -100,6 +100,13 @@ Where:
 - `client.provider` is `"openai"` or `"anthropic"`
 - `client:chat(opts)` returns an async task
 
+Optional client metadata fields:
+
+- `client.maxTokens`
+- `client.contextWindow`
+
+When present, the agent runtime uses these as default request/output and context-budget hints.
+
 The async task should resolve to a table with at least:
 
 - `text`
@@ -110,6 +117,8 @@ Minimal client contract example:
 ```lua
 local client = {
   provider = "openai",
+  maxTokens = 1024,
+  contextWindow = 128000,
   chat = function(self, opts)
     return async(function()
       return {
@@ -176,7 +185,7 @@ local a = agent.Agent.new({
   client = client,
   registry = registry,
   system = "You are a helpful agent.",
-  withPlan = true
+  withPlan = false
 })
 
 local session = agent.Session.new({
@@ -312,7 +321,7 @@ local a = agent.Agent.new({
   },
   toolTags = { "web", "math" },
   maxSteps = 12,
-  withPlan = true,
+  withPlan = false,
   model = "deepseek-chat",
   temperature = 0.2,
   planToolLimit = 8,
@@ -357,7 +366,7 @@ local a = agent.Agent.new({
   Maximum tool-calling loop iterations.
 
 - `withPlan`  
-  Whether `run` should plan by default.
+  Whether `run` should plan by default. This is useful for tool-heavy execution flows, but chat-style applications often prefer `false` and only call `plan` explicitly when needed.
 
 - `model`  
   Default model.
@@ -456,6 +465,7 @@ Important run options:
 - `model`
 - `temperature`
 - `timeout`
+- `max_tokens`
 - `system`
 - `instructions`
 - `constraints`
@@ -463,6 +473,8 @@ Important run options:
 - `history`
 - `plan`
 - `withPlan`
+- `contextWindow`
+- `contextSafetyBuffer`
 - `maxSteps`
 - `maxMessages`
 - `maxToolOutputChars`
@@ -489,6 +501,14 @@ Minimal supported form:
 ```
 
 The library will compact older history into a summary if it exceeds the configured raw window.
+
+If `contextWindow` information is available, the runtime also applies a token-budget pass before send:
+
+- it prefers `client.contextWindow`,
+- it falls back to `opts.contextWindow` as an override,
+- it reserves space for output using `max_tokens`,
+- it trims summary and older history before request,
+- it may retry with a smaller prompt when the provider reports a context overflow.
 
 ## 8. Session
 
@@ -551,10 +571,12 @@ print(result.text)
 By default, `Session:ask(...)`:
 
 - resolves profile and router,
-- optionally creates a plan,
+- optionally creates a plan based on `agent.withPlan` or `opts.withPlan`,
 - runs the agent,
 - appends the user and assistant turns back into history,
 - optionally runs post-turn memory extraction.
+
+For chat UIs, a good default is usually `withPlan = false` unless the turn is expected to require tool orchestration or you want to show/debug the plan itself.
 
 ### 8.4 Append history automatically
 

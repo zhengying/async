@@ -484,6 +484,7 @@ local function rebuildClients()
       apiKey = trimText(openai.apiKey),
       baseUrl = trimText(openai.baseUrl),
       model = trimText(openai.model),
+      contextWindow = tonumber(trimText(openai.contextWindow)),
       debug = logging.enabled,
       debugMaxLen = logging.maxPayloadChars,
       debugSink = llmLogSink,
@@ -501,6 +502,7 @@ local function rebuildClients()
       baseUrl = trimText(anthropic.baseUrl),
       model = trimText(anthropic.model),
       maxTokens = tonumber(trimText(anthropic.maxTokens)) or 1024,
+      contextWindow = tonumber(trimText(anthropic.contextWindow)),
       debug = logging.enabled,
       debugMaxLen = logging.maxPayloadChars,
       debugSink = llmLogSink,
@@ -1001,8 +1003,13 @@ local function appendTurnStats(userText, answerText, usage)
 end
 
 local function currentContextWindow()
+  local client = activeClient()
+  local configured = tonumber(client and client.contextWindow)
+  if configured and configured > 0 then
+    return configured
+  end
   local providerSettings = activeSettingsFor(currentProvider)
-  local configured = tonumber(trimText(providerSettings.contextWindow))
+  configured = tonumber(trimText(providerSettings.contextWindow))
   if configured and configured > 0 then
     return configured
   end
@@ -1473,6 +1480,17 @@ local function clearConversation()
   saveSessionState()
 end
 
+local function clearAllMemory()
+  clearConversation()
+  if chat then
+    chat:clearMemory(nil, "workspace")
+    chat:clearMemory(nil, "global")
+  end
+  statusText = "conversation and all memory cleared"
+  errorText = ""
+  saveSessionState()
+end
+
 cancelCurrent = function()
   if not currentTask then
     return
@@ -1490,20 +1508,39 @@ cancelCurrent = function()
   statusText = "stopped"
 end
 
-local function buildMessages(provider)
+local function buildMessages(provider, prompt, providerSettings)
   local messages = {}
+  local client = activeClient()
+  local contextWindow = tonumber(client and client.contextWindow) or tonumber(trimText(providerSettings and providerSettings.contextWindow)) or currentContextWindow()
+  local reservedOutput = tonumber(trimText(providerSettings and providerSettings.maxTokens)) or 1024
+  local contextBudget = contextWindow - reservedOutput - math.max(128, math.floor(contextWindow * 0.02))
+  local total = estimateTokenCount(prompt) + 6
   if provider == "openai" then
     messages[#messages + 1] = {
       role = "system",
       content = systemPrompt
     }
+    total = total + estimateTokenCount(systemPrompt) + 12
   end
-  for index = 1, #history do
+
+  local selected = {}
+  for index = #history, 1, -1 do
     local item = history[index]
-    messages[#messages + 1] = {
-      role = item.role,
-      content = item.content
-    }
+    if type(item) == "table" then
+      local messageCost = estimateTokenCount(item.content or "") + 6
+      if contextBudget > 0 and total + messageCost > contextBudget then
+        break
+      end
+      selected[#selected + 1] = {
+        role = item.role,
+        content = item.content
+      }
+      total = total + messageCost
+    end
+  end
+
+  for index = #selected, 1, -1 do
+    messages[#messages + 1] = selected[index]
   end
   return messages
 end
@@ -1553,7 +1590,7 @@ local function runRawChatFallback(prompt, provider, providerSettings, callbacks)
     })
     return nil, "no client", nil
   end
-  local messages = buildMessages(provider)
+  local messages = buildMessages(provider, prompt, providerSettings)
   messages[#messages + 1] = {
     role = "user",
     content = prompt
@@ -2194,7 +2231,7 @@ local function drawComposer()
 
   love.graphics.setFont(ui.fonts.small)
   setColor(ui.palette.muted)
-  love.graphics.print("Enter: send   Shift+Enter: newline   F1: clear input   F2: clear chat   F3: provider config   F4: agent debug   F5: logs on/off   F6: log level   F7: clear logs   Esc: quit", composer.x + 18, composer.y + 36)
+  love.graphics.print("Enter: send   Shift+Enter: newline   F1: clear input   F2: clear chat   Shift+F2: clear all memory   F3: provider config   F4: agent debug   F5: logs on/off   F6: log level   F7: clear logs   Esc: quit", composer.x + 18, composer.y + 36)
   local statusX = composer.x + 18
   local statusY = composer.y + 54
   local statusGap = 18
@@ -2580,7 +2617,12 @@ function love.keypressed(key)
     return
   end
   if key == "f2" then
-    clearConversation()
+    local shift = love.keyboard.isDown("lshift") or love.keyboard.isDown("rshift")
+    if shift then
+      clearAllMemory()
+    else
+      clearConversation()
+    end
     return
   end
   if key == "f3" then

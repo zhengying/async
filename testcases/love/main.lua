@@ -203,6 +203,41 @@ function love.load()
     assertTrue(gotResult, "expected threadpool_result log event")
   end)
 
+  runTest("ThreadPool workers inherit package paths", function()
+    async.clear()
+    async.setLogEnabled(false)
+    async.setLogLevel("off")
+    async.setLogSink(nil)
+
+    local pool = ThreadPool.new(1)
+    local parentPackagePath = package.path
+    local parentPackageCPath = package.cpath
+    local result
+
+    pool:register("inspect_package_paths", function()
+      local asyncModule = require("async")
+      local threadpoolModule = require("threadpool")
+      return {
+        packagePath = package.path,
+        packageCPath = package.cpath,
+        asyncType = type(asyncModule),
+        threadpoolType = type(threadpoolModule)
+      }
+    end)
+
+    async(function()
+      result = async.await(pool:submit("inspect_package_paths", nil, { timeout = 2 }))
+    end)
+
+    runFrames(3)
+
+    assertTrue(type(result) == "table", "expected table result from worker")
+    assertEq(result.packagePath, parentPackagePath, "worker package.path should inherit parent package.path")
+    assertEq(result.packageCPath, parentPackageCPath, "worker package.cpath should inherit parent package.cpath")
+    assertEq(result.asyncType, "table", "worker should require async")
+    assertEq(result.threadpoolType, "table", "worker should require threadpool")
+  end)
+
   runTest("ThreadPool timeout and cancel cleanup", function()
     async.clear()
     async.setLogEnabled(false)

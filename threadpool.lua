@@ -1,59 +1,4 @@
 -- async_threadpool.lua
--- Thread pool + async bridge for LÖVE using async.lua
--- Advanced version: progress events + streaming + cancel + await helpers
--- Requires: async.lua
-
--- Registered worker functions now receive:
--- 
--- fn(payload, ctx)
--- 
--- Where `ctx` provides:
--- ctx.progress(percent, data)
--- ctx.canceled() -> boolean
--- ---
--- -- example:
--- pool:register("generate_map", function(payload, ctx)
---     local n = payload.steps
---     local acc = 0
-
---     for i = 1, n do
---         if ctx.canceled() then
---             return "stopped early"
---         end
-
---         -- heavy work
---         acc = acc + math.sqrt(i)
-
---         if i % 1000 == 0 then
---             ctx.progress(i / n, { step = i })
---         end
---     end
-
---     return acc
--- end)
-
---  Use from async code
--- async(function()
-
---     local task = pool:submit("generate_map", {steps = 2e6}, {timeout = 10})
-
---     task:onProgress(function(p, data)
---         print("progress:", p, data.step)
---     end)
-
---     local result = async.await(function() return task end)
-
---     print("done:", result)
-
--- end)
-
--- Cancel Mid-Flight
--- local t = pool:submit("generate_map", {steps=1e9})
-
--- async.sleep(1.0)
--- t:cancel()
-
-
 local async = require("async")
 local unpack = unpack or table.unpack
 
@@ -65,7 +10,7 @@ ThreadPool.__index = ThreadPool
 -- =====================================================
 
 local WORKER_CODE = [[
-local jobName, resultName, progressName = ...
+local jobName, resultName, progressName, inheritedPackagePath, inheritedPackageCPath = ...
 
 local jobCh      = love.thread.getChannel(jobName)
 local resultCh   = love.thread.getChannel(resultName)
@@ -76,35 +21,13 @@ local loader = loadstring or load
 local unpack = unpack or table.unpack
 local pack = table.pack or function(...) return { n = select("#", ...), ... } end
 
-local sourceBase = love.filesystem and love.filesystem.getSourceBaseDirectory and love.filesystem.getSourceBaseDirectory()
-if type(sourceBase) ~= "string" then
-    sourceBase = "."
+if type(inheritedPackagePath) == "string" and inheritedPackagePath ~= "" then
+    package.path = inheritedPackagePath
 end
 
-local source = love.filesystem and love.filesystem.getSource and love.filesystem.getSource()
-local root = sourceBase
-if type(source) == "string" and source ~= "" then
-    if source:match("%.love$") then
-        root = source:match("^(.*)[/\\]") or sourceBase
-    else
-        root = source
-    end
-    if not (root:sub(1, 1) == "/" or root:match("^%a:[/\\]")) then
-        root = sourceBase .. "/" .. root
-    end
+if type(inheritedPackageCPath) == "string" and inheritedPackageCPath ~= "" then
+    package.cpath = inheritedPackageCPath
 end
-
-package.path = root .. "/?.lua;" .. root .. "/?/init.lua;" .. package.path
-local cpaths = {
-    root .. "/https_libs/?.so", root .. "/https_libs/?.dylib", root .. "/https_libs/?.dll",
-    root .. "/../https_libs/?.so", root .. "/../https_libs/?.dylib", root .. "/../https_libs/?.dll",
-    root .. "/../../https_libs/?.so", root .. "/../../https_libs/?.dylib", root .. "/../../https_libs/?.dll",
-    root .. "/../../../https_libs/?.so", root .. "/../../../https_libs/?.dylib", root .. "/../../../https_libs/?.dll",
-    root .. "/../../../../https_libs/?.so", root .. "/../../../../https_libs/?.dylib", root .. "/../../../../https_libs/?.dll",
-    root .. "/libs/?.so", root .. "/libs/?.dylib", root .. "/libs/?.dll",
-    root .. "/?.so", root .. "/?.dylib", root .. "/?.dll"
-}
-package.cpath = table.concat(cpaths, ";") .. ";" .. package.cpath
 
 local function makeCtx(id, cancelName)
     local cancelCh = love.thread.getChannel(cancelName)
@@ -189,6 +112,8 @@ function ThreadPool.new(size)
     self.workerJobCh = {}
     self._rr = 0
     self.destroyed = false
+    self.workerPackagePath = package.path
+    self.workerPackageCPath = package.cpath
 
     for i = 1, self.size do
         local jobName = self.prefix .. "_job_" .. i
@@ -197,7 +122,7 @@ function ThreadPool.new(size)
         self.workerJobCh[i]:clear()
 
         local th = love.thread.newThread(WORKER_CODE)
-        th:start(jobName, self.resultName, self.progressName)
+        th:start(jobName, self.resultName, self.progressName, self.workerPackagePath, self.workerPackageCPath)
         table.insert(self.workers, th)
     end
 

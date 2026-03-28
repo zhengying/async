@@ -161,6 +161,60 @@ local function messageContentToText(content)
   return table.concat(parts, "\n")
 end
 
+local function estimateTokenCount(text)
+  local value = tostring(text or "")
+  if value == "" then
+    return 0
+  end
+  local normalized = value:gsub("\r\n", "\n")
+  local chars = #normalized
+  local words = 0
+  for _ in normalized:gmatch("%S+") do
+    words = words + 1
+  end
+  local byChars = math.ceil(chars / 4)
+  local byWords = math.ceil(words * 1.35)
+  return math.max(1, math.max(byChars, byWords))
+end
+
+local function estimateMessageTokens(message)
+  if type(message) ~= "table" then
+    return 0
+  end
+  local total = estimateTokenCount(messageContentToText(message.content)) + 6
+  if type(message.tool_calls) == "table" then
+    for i = 1, #message.tool_calls do
+      local call = message.tool_calls[i]
+      if type(call) == "table" then
+        total = total + estimateTokenCount(call.id or "")
+        local fn = type(call["function"]) == "table" and call["function"] or nil
+        if fn then
+          total = total + estimateTokenCount(fn.name or "")
+          total = total + estimateTokenCount(fn.arguments or "")
+        end
+      end
+    end
+  end
+  if type(message.name) == "string" then
+    total = total + estimateTokenCount(message.name)
+  end
+  return total
+end
+
+local function estimateMessagesTokenUsage(provider, messages, systemText)
+  local total = 0
+  if provider == "anthropic" and isNonEmptyString(systemText) then
+    total = total + estimateTokenCount(systemText) + 12
+  end
+  if type(messages) ~= "table" then
+    return total
+  end
+  for i = 1, #messages do
+    total = total + estimateMessageTokens(messages[i])
+  end
+  return total
+end
+
 local function appendSection(lines, title, value)
   if not isNonEmptyString(value) then
     return
@@ -284,6 +338,176 @@ local function trimConversationMessages(messages, provider, maxMessages, keepFir
       table.remove(messages, keepFirst + 1)
     end
   end
+end
+
+local function dropEarliestConversationUnit(messages, provider, keepFirst, keepLast)
+  if type(messages) ~= "table" then
+    return false
+  end
+  keepFirst = tonumber(keepFirst or 0) or 0
+  keepLast = tonumber(keepLast or 0) or 0
+  if #messages <= keepFirst + keepLast then
+    return false
+  end
+
+  local boundary = #messages - keepLast
+  if provider == "openai" then
+    for i = keepFirst + 1, boundary do
+      local msg = messages[i]
+      if type(msg) == "table" and msg.role == "assistant" and type(msg.tool_calls) == "table" and #msg.tool_calls > 0 then
+        table.remove(messages, i)
+        while i <= #messages - keepLast do
+          local nextMsg = messages[i]
+          if type(nextMsg) == "table" and nextMsg.role == "tool" then
+            table.remove(messages, i)
+          else
+            break
+          end
+        end
+        return true
+      end
+    end
+  elseif provider == "anthropic" then
+    for i = keepFirst + 1, boundary do
+      local msg = messages[i]
+      if type(msg) == "table" and msg.role == "assistant" and contentHasBlockType(msg.content, "tool_use") then
+        table.remove(messages, i)
+        if i <= #messages - keepLast then
+          local nextMsg = messages[i]
+          if type(nextMsg) == "table" and nextMsg.role == "user" and contentHasBlockType(nextMsg.content, "tool_result") then
+            table.remove(messages, i)
+          end
+        end
+        return true
+      end
+    end
+  end
+
+  table.remove(messages, keepFirst + 1)
+  return true
+end
+
+local function trimMessagesToTokenBudget(messages, provider, systemText, maxTokens, keepFirst, keepLast)
+  if type(messages) ~= "table" then
+    return false
+  end
+  maxTokens = tonumber(maxTokens or 0) or 0
+  if maxTokens <= 0 then
+    return false
+  end
+  keepFirst = tonumber(keepFirst or 0) or 0
+  keepLast = tonumber(keepLast or 0) or 0
+  local changed = false
+  while estimateMessagesTokenUsage(provider, messages, systemText) > maxTokens and #messages > keepFirst + keepLast do
+    local removed = dropEarliestConversationUnit(messages, provider, keepFirst, keepLast)
+    if not removed then
+      break
+    end
+    changed = true
+  end
+  return changed
+end
+
+local function resolveRequestMaxTokens(opts, fallback)
+  local value = tonumber(type(opts) == "table" and opts.max_tokens or nil)
+  if value and value > 0 then
+    return value
+  end
+  value = tonumber(fallback)
+  if value and value > 0 then
+    return value
+  end
+  return nil
+end
+
+local function resolveContextBudgetTokens(opts, fallbackMaxTokens, client)
+  local contextWindow = tonumber(type(client) == "table" and client.contextWindow or nil)
+  if (not contextWindow or contextWindow <= 0) and type(opts) == "table" then
+    contextWindow = tonumber(opts.contextWindow)
+  end
+  if not contextWindow or contextWindow <= 0 then
+    return nil
+  end
+  local reservedOutput = resolveRequestMaxTokens(opts, fallbackMaxTokens) or 0
+  local safetyBuffer = tonumber(type(opts) == "table" and opts.contextSafetyBuffer or nil)
+  if not safetyBuffer or safetyBuffer < 0 then
+    safetyBuffer = math.max(128, math.floor(contextWindow * 0.02))
+  end
+  local budget = contextWindow - reservedOutput - safetyBuffer
+  if budget <= 0 then
+    return nil
+  end
+  return budget
+end
+
+local buildRunMessages
+
+local function buildRunMessagesForBudget(provider, goalText, historyMessages, systemBaseText, systemOpts, budgetTokens)
+  local summary = systemOpts.historySummary
+  local systemText = buildSystemText(systemBaseText, {
+    instructions = systemOpts.instructions,
+    constraints = systemOpts.constraints,
+    memory = systemOpts.memory,
+    historySummary = summary,
+    plan = systemOpts.plan
+  })
+  local messages = buildRunMessages(provider, systemText, historyMessages, goalText)
+  if not budgetTokens or budgetTokens <= 0 then
+    return systemText, messages, summary
+  end
+
+  while isNonEmptyString(summary) and estimateMessagesTokenUsage(provider, messages, systemText) > budgetTokens do
+    if #summary <= 256 then
+      summary = nil
+    else
+      summary = truncateString(summary, math.max(256, math.floor(#summary * 0.7)))
+    end
+    systemText = buildSystemText(systemBaseText, {
+      instructions = systemOpts.instructions,
+      constraints = systemOpts.constraints,
+      memory = systemOpts.memory,
+      historySummary = summary,
+      plan = systemOpts.plan
+    })
+    messages = buildRunMessages(provider, systemText, historyMessages, goalText)
+  end
+
+  if estimateMessagesTokenUsage(provider, messages, systemText) > budgetTokens then
+    trimMessagesToTokenBudget(messages, provider, systemText, budgetTokens, provider == "openai" and 1 or 0, 1)
+  end
+
+  return systemText, messages, summary
+end
+
+local function isContextOverflowError(err, extra)
+  local parts = { tostring(err or "") }
+  if type(extra) == "table" then
+    if type(extra.body) == "string" then
+      parts[#parts + 1] = extra.body
+    end
+    if type(extra.json) == "table" then
+      local message = extra.json.message
+      local errObj = extra.json.error
+      if type(message) == "string" then
+        parts[#parts + 1] = message
+      end
+      if type(errObj) == "table" and type(errObj.message) == "string" then
+        parts[#parts + 1] = errObj.message
+      end
+    end
+  end
+  local text = string.lower(table.concat(parts, "\n"))
+  if text == "" then
+    return false
+  end
+  return text:find("context length", 1, true) ~= nil
+      or text:find("context window", 1, true) ~= nil
+      or text:find("maximum context", 1, true) ~= nil
+      or text:find("prompt is too long", 1, true) ~= nil
+      or text:find("prompt too long", 1, true) ~= nil
+      or text:find("too many tokens", 1, true) ~= nil
+      or text:find("reduce the length", 1, true) ~= nil
+      or text:find("requested ", 1, true) ~= nil and text:find(" tokens", 1, true) ~= nil
 end
 
 local function validateToolInput(schema, input)
@@ -740,7 +964,7 @@ local function compactHistoryMessages(provider, history, maxHistoryMessages, max
   return recent, summary
 end
 
-local function buildRunMessages(provider, systemText, history, goalText)
+buildRunMessages = function(provider, systemText, history, goalText)
   local recentHistory = history or {}
   if provider == "openai" then
     local messages = {
@@ -1002,6 +1226,7 @@ function Agent:plan(goal, opts)
     temperature = opts.temperature or self.temperature or 0,
     messages = messages,
     system = provider == "anthropic" and prompt or nil,
+    max_tokens = resolveRequestMaxTokens(opts, self.client and self.client.maxTokens),
     extra = extra,
     timeout = opts.timeout
   })
@@ -1069,14 +1294,23 @@ function Agent:run(goal, opts)
     opts.maxHistoryMessages or self.maxHistoryMessages,
     opts.maxHistorySummaryChars or self.maxHistorySummaryChars
   )
-  local systemText = buildSystemText(opts.system or self.system, {
+  local systemOpts = {
     instructions = concatStringArrays(self.instructions, opts.instructions),
     constraints = concatStringArrays(self.constraints, opts.constraints),
     memory = opts.memory,
     historySummary = historySummary,
     plan = type(planList) == "table" and jsonStringify(planList) or nil
-  })
-  local messages = buildRunMessages(provider, systemText, historyMessages, goalText)
+  }
+  local requestMaxTokens = resolveRequestMaxTokens(opts, self.client and self.client.maxTokens)
+  local contextBudgetTokens = resolveContextBudgetTokens(opts, requestMaxTokens, self.client)
+  local systemText, messages = buildRunMessagesForBudget(
+    provider,
+    goalText,
+    historyMessages,
+    opts.system or self.system,
+    systemOpts,
+    contextBudgetTokens
+  )
 
   return async(function()
     local maxMessages = tonumber(opts.maxMessages or "") or 40
@@ -1104,29 +1338,54 @@ function Agent:run(goal, opts)
 
       trimConversationMessages(messages, provider, maxMessages, keepFirst)
       trimMessages(messages, maxMessages, keepFirst)
-      local task = self.client:chat({
-        model = opts.model or self.model,
-        temperature = opts.temperature or self.temperature,
-        messages = messages,
-        system = provider == "anthropic" and systemText or nil,
-        extra = extra,
-        timeout = opts.timeout,
-        stream = opts.stream,
-        onResponse = opts.onResponse,
-        onChunk = opts.onChunk,
-        onEvent = opts.onEvent,
-        onText = function(delta, text, meta)
-          if type(opts.onText) == "function" then
-            local metaOut = type(meta) == "table" and shallowCopyTable(meta) or {}
-            metaOut.step = step
-            metaOut.provider = provider
-            metaOut.goal = goalText
-            opts.onText(delta, text, metaOut)
-          end
-        end
-      })
+      if contextBudgetTokens then
+        trimMessagesToTokenBudget(messages, provider, systemText, contextBudgetTokens, provider == "openai" and 1 or 0, 1)
+      end
 
-      local result, err, extra2 = async.await(task)
+      local result, err, extra2
+      local overflowAttempts = 0
+      while true do
+        local task = self.client:chat({
+          model = opts.model or self.model,
+          temperature = opts.temperature or self.temperature,
+          messages = messages,
+          system = provider == "anthropic" and systemText or nil,
+          max_tokens = requestMaxTokens,
+          extra = extra,
+          timeout = opts.timeout,
+          stream = opts.stream,
+          onResponse = opts.onResponse,
+          onChunk = opts.onChunk,
+          onEvent = opts.onEvent,
+          onText = function(delta, text, meta)
+            if type(opts.onText) == "function" then
+              local metaOut = type(meta) == "table" and shallowCopyTable(meta) or {}
+              metaOut.step = step
+              metaOut.provider = provider
+              metaOut.goal = goalText
+              opts.onText(delta, text, metaOut)
+            end
+          end
+        })
+
+        result, err, extra2 = async.await(task)
+        if type(result) == "table" then
+          break
+        end
+        if not contextBudgetTokens or overflowAttempts >= 2 or not isContextOverflowError(err, extra2) then
+          return nil, err, extra2
+        end
+        overflowAttempts = overflowAttempts + 1
+        local retryBudget = math.max(1, contextBudgetTokens - overflowAttempts * math.max(128, math.floor(contextBudgetTokens * 0.05)))
+        local changed = trimMessagesToTokenBudget(messages, provider, systemText, retryBudget, provider == "openai" and 1 or 0, 1)
+        if not changed then
+          changed = dropEarliestConversationUnit(messages, provider, provider == "openai" and 1 or 0, 1)
+        end
+        if not changed then
+          return nil, err, extra2
+        end
+      end
+
       if type(result) ~= "table" then
         return nil, err, extra2
       end
@@ -1288,19 +1547,52 @@ local function concatManyTextSections(...)
   return out
 end
 
+local function normalizeMemoryItem(value)
+  if not isNonEmptyString(value) then
+    return nil
+  end
+  local s = tostring(value):gsub("^%s+", ""):gsub("%s+$", "")
+  return s ~= "" and s or nil
+end
+
+local function memoryItemKey(value)
+  local normalized = normalizeMemoryItem(value)
+  if not normalized then
+    return nil
+  end
+  local key = normalized
+    :gsub("%s+", " ")
+    :gsub("^[%-%*•]+%s*", "")
+    :gsub("[%s%.!,;:]+$", "")
+    :lower()
+  return key ~= "" and key or nil
+end
+
 local function normalizeMemoryItems(v)
+  local seen = {}
+  local function push(out, value)
+    local normalized = normalizeMemoryItem(value)
+    if not normalized then
+      return
+    end
+    local key = memoryItemKey(normalized)
+    if key == "" or seen[key] then
+      return
+    end
+    seen[key] = true
+    out[#out + 1] = normalized
+  end
   if type(v) == "string" then
-    local s = v:gsub("^%s+", ""):gsub("%s+$", "")
-    return s ~= "" and { s } or {}
+    local out = {}
+    push(out, v)
+    return out
   end
   if type(v) ~= "table" then
     return {}
   end
   local out = {}
   for i = 1, #v do
-    if isNonEmptyString(v[i]) then
-      out[#out + 1] = v[i]
-    end
+    push(out, v[i])
   end
   return out
 end
@@ -1316,12 +1608,12 @@ local function cloneStringList(items)
 end
 
 local function stringListContains(items, value)
-  local target = tostring(value or "")
-  if target == "" or type(items) ~= "table" then
+  local targetKey = memoryItemKey(value)
+  if targetKey == nil or type(items) ~= "table" then
     return false
   end
   for i = 1, #items do
-    if tostring(items[i]) == target then
+    if memoryItemKey(items[i]) == targetKey then
       return true
     end
   end
@@ -1388,9 +1680,9 @@ function MemoryStore:remove(section, value)
   if section ~= "facts" and section ~= "preferences" and section ~= "goals" and section ~= "notes" then
     return self
   end
-  local target = tostring(value or "")
+  local target = memoryItemKey(value)
   for i = #self[section], 1, -1 do
-    if tostring(self[section][i]) == target then
+    if memoryItemKey(self[section][i]) == target then
       table.remove(self[section], i)
     end
   end
@@ -1945,6 +2237,7 @@ end
 
 function Session:clear()
   self.history = {}
+  self:clearMemory(nil, "session")
 end
 
 function Session:setMemory(memory, scope)

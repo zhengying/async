@@ -222,7 +222,12 @@ do
   })
   local session = agent.Session.new({
     agent = a,
-    memory = "Keep track of user facts."
+    memory = "Keep track of user facts.",
+    memoryStore = agent.MemoryStore.new({
+      facts = {
+        "Alice likes careful explanations."
+      }
+    })
   })
 
   local task = async(function()
@@ -244,6 +249,7 @@ do
   T.assertMatch(captured[3].messages[1].content, "Alice", "session plan should include prior turn context")
   session:clear()
   T.assertEq(#session:getHistory(), 0, "session clear should remove history")
+  T.assertEq(session:getMemory("session"), nil, "session clear should remove session memory text and store")
 end
 
 do
@@ -565,6 +571,36 @@ do
   session:clearMemory()
   session:importState(snapshot)
   T.assertMatch(session:getMemory(), "The user's name is Alice", "imported memory store should restore renderable memory")
+end
+
+do
+  harness.reset()
+
+  local store = agent.MemoryStore.new({
+    facts = {
+      "Rust is important.  ",
+      "rust is important",
+      "  Rust is important! "
+    },
+    goals = {
+      "Learn ownership",
+      "Learn ownership."
+    }
+  })
+
+  T.assertEq(#store:get("facts"), 1, "memory store init should deduplicate semantically equivalent facts")
+  T.assertEq(#store:get("goals"), 1, "memory store init should deduplicate semantically equivalent goals")
+
+  store:add("facts", "  rust is important   ")
+  store:add("facts", "RUST IS IMPORTANT.")
+  store:add("notes", {
+    "Use short examples.",
+    "Use short examples"
+  })
+  store:remove("notes", "use short examples")
+
+  T.assertEq(#store:get("facts"), 1, "memory store add should not append duplicates with casing or punctuation differences")
+  T.assertEq(#store:get("notes"), 0, "memory store remove should match normalized values")
 end
 
 do
